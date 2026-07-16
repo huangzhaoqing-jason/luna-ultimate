@@ -1,5 +1,9 @@
 # Luna-Ultimate 全平台部署指南
 
+> **双轨（2026）**：Ollama 蒸馏版（Track A）与 Native `luna serve`（Track B，含 VLM/VLA/World-Action）。
+> 详见 [docs/zh-CN/DEPLOYMENT.md](docs/zh-CN/DEPLOYMENT.md)。
+> 完整异构架构不能原样进入 Ollama；`ollama run luna` = 兼容学生；满性能/VLA/WA = `python3 scripts/run_serve.py`。
+
 ## 架构概览
 
 ```

@@ -67,6 +67,10 @@ class LunaConfig:
         "ema_decay": 0.996,
     })
 
+    # ==================== VLA / World-Action ====================
+    vla_enabled: bool = True
+    wa_enabled: bool = True
+
     # ==================== FlashMoE ====================
     num_routed_experts: int = 48
     num_shared_experts: int = 2

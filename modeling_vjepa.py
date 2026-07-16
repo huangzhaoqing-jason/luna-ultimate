@@ -182,17 +182,20 @@ class VisionPredictor(nn.Module):
         """
         B, N_visible, D = encoder_output.shape
         N_total = mask.shape[1]
-        N_masked = mask.sum(dim=1).max().item()
 
-        # Create full sequence with mask tokens
-        # Place encoder output at visible positions, mask tokens at masked positions
-        full = torch.zeros(B, N_total, D, device=encoder_output.device, dtype=encoder_output.dtype)
-        full[:, ~mask, :] = encoder_output
-        full[:, mask, :] = self.mask_token.expand(B, N_masked, -1)[:, :N_masked, :]
-
-        # Restore original order
-        batch_indices = torch.arange(B, device=encoder_output.device).unsqueeze(1)
-        full = full[batch_indices, ids_restore]
+        # Inference / no-mask: encoder already saw all patches
+        if N_visible == N_total and not bool(mask.any()):
+            full = encoder_output
+        else:
+            # Per-batch scatter: visible features + mask tokens → full sequence
+            full = self.mask_token.expand(B, N_total, D).clone()
+            for b in range(B):
+                vis_idx = (~mask[b]).nonzero(as_tuple=False).squeeze(-1)
+                n_vis = min(int(vis_idx.numel()), encoder_output.shape[1])
+                if n_vis > 0:
+                    full[b, vis_idx[:n_vis], :] = encoder_output[b, :n_vis, :]
+            batch_indices = torch.arange(B, device=encoder_output.device).unsqueeze(1)
+            full = full[batch_indices, ids_restore]
 
         # Apply predictor blocks
         for block in self.blocks:
@@ -223,6 +226,9 @@ class VJEPA(nn.Module):
         mask_ratio: Fraction of patches to mask (0.0-1.0).
         use_target_encoder: Whether to use EMA target encoder.
         ema_decay: EMA decay rate for target encoder.
+        out_dim: Projection dim for fusion with language backbone
+            (must equal LunaConfig.hidden_size). Defaults to embed_dim
+            when omitted — callers should pass config.hidden_size.
     """
 
     def __init__(
@@ -237,9 +243,11 @@ class VJEPA(nn.Module):
         mask_ratio: float = 0.75,
         use_target_encoder: bool = True,
         ema_decay: float = 0.996,
+        out_dim: Optional[int] = None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
+        self.out_dim = int(out_dim) if out_dim is not None else int(embed_dim)
         self.mask_ratio = mask_ratio
         self.use_target_encoder = use_target_encoder
         self.ema_decay = ema_decay
@@ -261,7 +269,7 @@ class VJEPA(nn.Module):
         self.predictor = VisionPredictor(embed_dim, predictor_depth, num_heads)
 
         # Projection from vision_dim to model's hidden_size for fusion
-        self.projector = nn.Linear(embed_dim, 8192)  # 8192 = Luna d_model
+        self.projector = nn.Linear(embed_dim, self.out_dim)
 
     def _init_target_encoder(self):
         """Initialize target encoder with same weights as context encoder."""
@@ -383,7 +391,7 @@ class VJEPA(nn.Module):
             self._update_target_encoder()
 
         # Project to model dimension for fusion
-        # [B, N, embed_dim] → [B, N, d_model=8192]
+        # [B, N, embed_dim] → [B, N, out_dim=hidden_size]
         vision_features = self.projector(predictions)
 
         return vision_features, vjepa_loss, predictions

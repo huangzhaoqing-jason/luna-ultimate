@@ -2,7 +2,8 @@
 
 - [安全与忠诚](./SAFETY.md)
 - [全脑架构 WB-HCA](./BRAIN_ARCHITECTURE.md)
-- 英文原文：`docs/SAFETY.md`、`docs/BRAIN_ARCHITECTURE.md`、`docs/ARCHITECTURE.md`、`docs/COST_MODEL.md`、`docs/SCALE_LADDER.md`
+- [双轨部署（Ollama + Native）](./DEPLOYMENT.md)
+- 英文原文：`docs/SAFETY.md`、`docs/BRAIN_ARCHITECTURE.md`、`docs/ARCHITECTURE.md`、`docs/COST_MODEL.md`、`docs/SCALE_LADDER.md`、`DEPLOYMENT.md`
 
 ## 常用命令（中文日志）
 

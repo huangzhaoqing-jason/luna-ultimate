@@ -16,8 +16,10 @@
 | 颞叶 | 知识 | FlashMoE + `rag/` |
 | 语言区 | 解码 | `MeaningFirstDecoder`（无 AR fallback） |
 | 脑干 / 杏仁核 | 安全门 | charter + values + SafetyCTM |
+| 运动皮层 | VLA 动作 | `modeling_vla.ActionHead` |
+| 世界模型 | World-Action | `modeling_world_action.WorldActionModule` |
 
-完整表见 `modeling_neuroarch.py::WB_HCA`。
+完整表见 `modeling_neuroarch.py::WB_HCA`。部署见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
 
 ## 意义优先解码（Q1B / Q3B）
 

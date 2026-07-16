@@ -183,10 +183,31 @@ def register_mlx_backends():
     return False
 
 
+def smoke_probe() -> dict:
+    """MLX 冒烟：有 MLX 则跑桥接；否则报告不可用（不抛）。"""
+    import torch
+    if not HAS_MLX:
+        return {"ok": True, "available": False, "detail": "mlx not installed; use cpu/cuda"}
+    x = torch.randn(1, 4, 8)
+    # 最小：把 tensor 转到 numpy 再回 — 验证桥
+    try:
+        arr = x.detach().cpu().numpy()
+        back = torch.from_numpy(arr)
+        return {
+            "ok": True,
+            "available": True,
+            "bridge_ok": back.shape == x.shape,
+            "detail": "mlx installed; torch↔numpy bridge ok",
+        }
+    except Exception as e:
+        return {"ok": False, "available": True, "error": str(e)}
+
+
 __all__ = [
     "mamba2_scan_mlx",
     "flash_attention_mlx",
     "moe_gate_mlx",
     "register_mlx_backends",
+    "smoke_probe",
     "HAS_MLX",
 ]

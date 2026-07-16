@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,7 @@ class LunaUltimateFused(nn.Module):
                 mask_ratio=vjepa_config.get("mask_ratio", 0.75),
                 use_target_encoder=vjepa_config.get("use_target_encoder", True),
                 ema_decay=vjepa_config.get("ema_decay", 0.996),
+                out_dim=self.d_model,
             )
         else:
             self.vjepa = None
@@ -84,6 +85,21 @@ class LunaUltimateFused(nn.Module):
         self.meaning_decoder = MeaningFirstDecoder(config, lm_head=self.lm_head)
         self.collapse_detector = CollapseDetector()
         self.last_route_plan: Optional[RoutePlan] = None
+
+        # VLA / World-Action（可选能力面；默认开启轻量头）
+        self.vla_enabled = bool(getattr(config, "vla_enabled", True))
+        self.wa_enabled = bool(getattr(config, "wa_enabled", True))
+        if self.vla_enabled:
+            from modeling_vla import ActionHead
+            self.action_head = ActionHead(config)
+        else:
+            self.action_head = None
+        if self.wa_enabled:
+            from modeling_world_action import WorldActionModule
+            n_act = len(self.action_head.tokenizer) if self.action_head is not None else 10
+            self.world_action = WorldActionModule(config, n_actions=n_act)
+        else:
+            self.world_action = None
 
         self.skip_probe_12 = nn.Linear(config.ctm_n_neurons, 1, bias=False)
         self.skip_probe_24 = nn.Linear(config.ctm_n_neurons, 1, bias=False)
@@ -176,11 +192,16 @@ class LunaUltimateFused(nn.Module):
         route_text: Optional[str] = None,
         decode_mode: Optional[str] = None,
         labels: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        proprio: Optional[torch.Tensor] = None,
+        next_visual_hidden: Optional[torch.Tensor] = None,
+        compute_vla: bool = False,
+        compute_wa: bool = False,
+        action_labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
         del attention_mask  # reserved
         B, L_txt = input_ids.shape
         device = input_ids.device
-        outputs: Dict[str, torch.Tensor] = {}
+        outputs: Dict[str, Any] = {}
         mode = decode_mode or self.decode_mode
         if use_int4_cache is None:
             use_int4_cache = bool(self.config.use_kv_cache_int4) and not self.training
@@ -189,6 +210,8 @@ class LunaUltimateFused(nn.Module):
         plan: Optional[RoutePlan] = None
         if route_text is not None:
             plan = self.thalamus.plan_from_text(route_text)
+        elif compute_vla or visual_input is not None:
+            plan = self.thalamus.plan_from_text("vision planning action")
         self.last_route_plan = plan
         prev_topk = self._apply_expert_budget(plan)
 
@@ -312,9 +335,32 @@ class LunaUltimateFused(nn.Module):
 
             outputs["logits"] = logits
             outputs["decode_mode"] = mode
+            outputs["hidden_states"] = hidden_states
             if plan is not None:
                 outputs["expert_budget"] = torch.tensor(plan.expert_budget, device=device)
                 outputs["thalamus_task"] = plan.task_type.value
+
+            # VLA / World-Action 头（按需）
+            if compute_vla and self.action_head is not None:
+                vla_out = self.action_head(
+                    hidden_states, proprio=proprio, action_labels=action_labels
+                )
+                outputs["action_logits"] = vla_out.action_logits
+                outputs["action_ids"] = vla_out.action_ids
+                outputs["action_names"] = vla_out.action_names  # type: ignore[assignment]
+                outputs["action_mu"] = vla_out.action_mu
+                if vla_out.action_loss is not None:
+                    outputs["action_loss"] = vla_out.action_loss
+
+            if compute_wa and self.world_action is not None:
+                wa_out = self.world_action(
+                    hidden_states, next_obs_hidden=next_visual_hidden
+                )
+                outputs["world_current"] = wa_out.current_latent
+                outputs["world_next"] = wa_out.next_latent
+                outputs["action_prior_logits"] = wa_out.action_prior_logits
+                if wa_out.world_loss is not None:
+                    outputs["world_loss"] = wa_out.world_loss
 
             avg_ticks = float(sum(tick_list) / max(1, len(tick_list)))
             self.last_avg_ticks = avg_ticks
