@@ -1,14 +1,14 @@
-"""Download Luna-Ultimate 550B weights from ModelScope.
+"""Download Luna-Ultimate weights from ModelScope.
 
 Usage:
     python download_weights.py \
-        --repo huangzhaoqing-jason/luna-ultimate-550b \
-        --output ./checkpoints
+        --repo huang18928827157/luna-ultimate \
+        --output ./modelscope_release
 
     # Or with specific revision
     python download_weights.py \
-        --repo huangzhaoqing-jason/luna-ultimate-550b \
-        --revision v1.0 \
+        --repo huang18928827157/luna-ultimate \
+        --revision master \
         --output ./checkpoints
 
 Requirements:
@@ -29,11 +29,11 @@ def parse_args():
     )
     parser.add_argument(
         "--repo", type=str,
-        default="huang18928827157/luna-ultimate-550b",
+        default="huang18928827157/luna-ultimate",
         help="ModelScope repo name (namespace/model_name)"
     )
     parser.add_argument(
-        "--output", type=str, default="./checkpoints",
+        "--output", type=str, default="./modelscope_release",
         help="Output directory for downloaded weights"
     )
     parser.add_argument(
