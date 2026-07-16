@@ -1,0 +1,4 @@
+interface:
+  display_name: "Parallel Task Tmux"
+  short_description: "Run parallel plan tasks in live tmux panes"
+  default_prompt: "Run the plan with /parallel-task-tmux so each worker is visible in tmux while tasks execute."
