@@ -217,6 +217,49 @@ class DummyDataset(torch.utils.data.Dataset):
         return {"input_ids": ids[:-1], "labels": ids[1:]}
 
 
+class DummyImageDataset(torch.utils.data.Dataset):
+    """VLM 占位：随机图像 + token。"""
+
+    def __init__(self, vocab_size: int, seq_len: int, img_size, num_samples: int = 1000):
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.img_h, self.img_w = img_size if isinstance(img_size, tuple) else (img_size, img_size)
+        self.num_samples = num_samples
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        ids = torch.randint(0, self.vocab_size, (self.seq_len,))
+        img = torch.randn(3, self.img_h, self.img_w)
+        return {"input_ids": ids[:-1], "labels": ids[1:], "visual_input": img}
+
+
+class DummyEpisodeDataset(torch.utils.data.Dataset):
+    """VLA / WA 占位：图像 + 指令 tokens + 动作标签。"""
+
+    def __init__(self, vocab_size: int, seq_len: int, img_size, n_actions: int = 10, num_samples: int = 1000):
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.img_h, self.img_w = img_size if isinstance(img_size, tuple) else (img_size, img_size)
+        self.n_actions = n_actions
+        self.num_samples = num_samples
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        ids = torch.randint(0, self.vocab_size, (self.seq_len,))
+        img = torch.randn(3, self.img_h, self.img_w)
+        action = torch.randint(0, self.n_actions, (1,)).squeeze(0)
+        return {
+            "input_ids": ids[:-1],
+            "labels": ids[1:],
+            "visual_input": img,
+            "action_labels": action,
+        }
+
+
 def setup_distributed():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
@@ -251,10 +294,14 @@ def train(args: argparse.Namespace):
         args.num_workers = 0
         config.max_steps = min(config.max_steps, args.max_steps or 5)
 
+    modality = getattr(args, "modality", "text")
+    if modality in ("vlm", "vla", "wa"):
+        config.vjepa_enabled = True
+
     if is_main:
         logger.info("=" * 60)
         logger.info("  Luna Evolve Training (LunaUltimateFused)")
-        logger.info(f"  Preset: {config.preset_name} | GPUs: {world_size} | Device: {device}")
+        logger.info(f"  Preset: {config.preset_name} | modality={modality} | GPUs: {world_size} | Device: {device}")
         logger.info("=" * 60)
 
     model = LunaUltimateFused(config).to(device)
@@ -294,7 +341,13 @@ def train(args: argparse.Namespace):
     use_amp = args.use_amp and device.type == "cuda" and config.mixed_precision == "bf16"
     scaler = GradScaler(enabled=use_amp)
 
-    dataset = DummyDataset(config.vocab_size, args.seq_len, args.num_samples)
+    img_size = tuple(config.vjepa_config.get("img_size", (32, 32)))
+    if modality == "vlm":
+        dataset = DummyImageDataset(config.vocab_size, args.seq_len, img_size, args.num_samples)
+    elif modality in ("vla", "wa"):
+        dataset = DummyEpisodeDataset(config.vocab_size, args.seq_len, img_size, 10, args.num_samples)
+    else:
+        dataset = DummyDataset(config.vocab_size, args.seq_len, args.num_samples)
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
         dataloader = DataLoader(
@@ -330,6 +383,8 @@ def train(args: argparse.Namespace):
 
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
+            visual = batch["visual_input"].to(device) if "visual_input" in batch else None
+            action_labels = batch["action_labels"].to(device) if "action_labels" in batch else None
             raw_model = model.module if hasattr(model, "module") else model
 
             amp_ctx = (
@@ -340,9 +395,13 @@ def train(args: argparse.Namespace):
             with amp_ctx:
                 outputs = raw_model(
                     input_ids,
+                    visual_input=visual,
                     use_ctm_adaptive=True,
                     use_dynamic_skip=args.dynamic_layer_skip,
                     return_all_losses=True,
+                    compute_vla=(modality == "vla"),
+                    compute_wa=(modality == "wa"),
+                    action_labels=action_labels,
                 )
                 avg_ticks = float(outputs.get("avg_ticks", torch.tensor(raw_model.last_avg_ticks)).item())
                 ctm_ticks_sum += avg_ticks
@@ -364,6 +423,12 @@ def train(args: argparse.Namespace):
                 moe_loss = outputs.get("moe_loss", torch.zeros((), device=device))
                 ctmj = outputs.get("ctmj_loss", torch.zeros((), device=device))
                 total_loss = loss + moe_loss + 0.1 * ctmj
+                if outputs.get("action_loss") is not None:
+                    total_loss = total_loss + outputs["action_loss"]
+                if outputs.get("world_loss") is not None:
+                    total_loss = total_loss + outputs["world_loss"]
+                if outputs.get("vjepa_loss") is not None and modality == "vlm":
+                    total_loss = total_loss + 0.1 * outputs["vjepa_loss"]
                 total_loss = total_loss / args.grad_accum
 
             if use_amp:
@@ -437,6 +502,13 @@ def main():
     parser = argparse.ArgumentParser(description="Luna Evolve Training")
     parser.add_argument("--preset", type=str, default="tiny")
     parser.add_argument("--smoke", action="store_true", help="Tiny smoke run")
+    parser.add_argument(
+        "--modality",
+        type=str,
+        default="text",
+        choices=["text", "vlm", "vla", "wa"],
+        help="训练模态：text / vlm / vla / wa（占位数据）",
+    )
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=1)

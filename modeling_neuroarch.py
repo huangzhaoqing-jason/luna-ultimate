@@ -119,6 +119,22 @@ WB_HCA: Dict[str, BrainRegion] = {
         wake_cost="low",
         default_awake=True,
     ),
+    "motor_cortex": BrainRegion(
+        name="motor_cortex",
+        biological_analogue="motor cortex / action output",
+        module="modeling_vla.ActionHead",
+        function="VLA discrete + continuous action for embodiment",
+        wake_cost="mid",
+        default_awake=False,
+    ),
+    "world_model": BrainRegion(
+        name="world_model",
+        biological_analogue="predictive coding / world model",
+        module="modeling_world_action.WorldActionModule",
+        function="JEPA next-state prediction + action prior (World-Action)",
+        wake_cost="high",
+        default_awake=False,
+    ),
 }
 
 
@@ -130,6 +146,8 @@ TASK_REGION_BIAS: Dict[str, Sequence[str]] = {
     "planning": ("prefrontal_cortex", "hippocampus", "working_memory", "default_mode"),
     "memory": ("hippocampus", "working_memory", "language_areas"),
     "safety": ("amygdala_safety", "prefrontal_cortex"),
+    "vla": ("motor_cortex", "temporal_association", "prefrontal_cortex", "thalamus"),
+    "wa": ("world_model", "motor_cortex", "prefrontal_cortex", "hippocampus"),
 }
 
 

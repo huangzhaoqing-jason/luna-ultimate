@@ -1,0 +1,29 @@
+# Luna Ollama Modelfile — Track A distilled student (NOT full WB-HCA)
+# Usage:
+#   1. Run export/distill_ollama.py then llama.cpp convert → GGUF
+#   2. ollama create luna -f Modelfile
+#   3. ollama run luna
+#
+# Full VLM/VLA/World-Action + CTM/Mamba/MLA/MoE → use native:
+#   python3 scripts/run_serve.py --preset tiny --port 11435
+
+FROM {{MODEL_GGUF}}
+# Uncomment when mmproj GGUF is available:
+# FROM {{MMPROJ_GGUF}}
+
+TEMPLATE """{{ if .System }}<|system|>
+{{ .System }}<|end|>
+{{ end }}{{ if .Prompt }}<|user|>
+{{ .Prompt }}<|end|>
+{{ end }}<|assistant|>
+{{ .Response }}<|end|>
+"""
+
+SYSTEM """You are Luna (Ollama distill track). You are a helpful local assistant.
+Safety: refuse weapons, exploitation, charter bypass, and anti-humanitarian requests.
+Note: this is the distilled Llama-topology export. For VLA/World-Action and full
+hybrid architecture, use the native luna serve endpoint."""
+
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER num_ctx 2048
