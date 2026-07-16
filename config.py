@@ -46,6 +46,25 @@ class LunaConfig:
     ctm_max_ticks: int = 4
     ctm_entropy_thresholds: Tuple[float, float, float] = (0.3, 0.6, 0.9)
 
+    # ==================== CTM-JEPA ====================
+    ctm_jepa_enabled: bool = True
+    ctm_jepa_horizon: int = 1        # How many ticks ahead to predict
+    ctm_jepa_ema_decay: float = 0.996  # EMA decay for target predictor
+
+    # ==================== V-JEPA ====================
+    vjepa_config: dict = field(default_factory=lambda: {
+        "img_size": (224, 224),
+        "patch_size": (2, 16, 16),
+        "in_channels": 3,
+        "embed_dim": 1024,
+        "encoder_depth": 24,
+        "predictor_depth": 6,
+        "num_heads": 16,
+        "mask_ratio": 0.75,
+        "use_target_encoder": True,
+        "ema_decay": 0.996,
+    })
+
     # ==================== FlashMoE ====================
     num_routed_experts: int = 48     # Adjusted to hit 550B target
     num_shared_experts: int = 2

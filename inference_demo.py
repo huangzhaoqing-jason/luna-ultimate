@@ -166,7 +166,7 @@ class LunaInference:
 
             # --- Mamba2 layers (1-12) ---
             for layer_idx in range(self.config.mamba2_layers):
-                ctm_output, _, num_ticks = self.model.ctm(
+                ctm_output, _, num_ticks, _ = self.model.ctm(
                     hidden_states, use_adaptive_early_exit=use_ctm_adaptive
                 )
                 ctm_ticks_log.append(num_ticks)
@@ -181,7 +181,7 @@ class LunaInference:
             # --- MLA layers (13-32) ---
             for layer_idx in range(self.config.mla_layers):
                 global_idx = layer_idx + self.config.mamba2_layers
-                ctm_output, _, num_ticks = self.model.ctm(
+                ctm_output, _, num_ticks, _ = self.model.ctm(
                     hidden_states, use_adaptive_early_exit=use_ctm_adaptive
                 )
 

@@ -167,7 +167,7 @@ class LunaUltimate(nn.Module):
                     continue
 
             # CTM residual
-            ctm_output, sync_matrix, num_ticks = self.ctm(
+            ctm_output, sync_matrix, num_ticks, _ = self.ctm(
                 hidden_states,
                 use_adaptive_early_exit=use_ctm_adaptive,
             )
@@ -201,7 +201,7 @@ class LunaUltimate(nn.Module):
                     continue
 
             # CTM residual
-            ctm_output, sync_matrix, num_ticks = self.ctm(
+            ctm_output, sync_matrix, num_ticks, _ = self.ctm(
                 hidden_states,
                 use_adaptive_early_exit=use_ctm_adaptive,
             )
@@ -242,7 +242,7 @@ class LunaUltimate(nn.Module):
         """
         updated_states = []
         for layer_idx in range(self.mamba2_layers):
-            ctm_output, _, _ = self.ctm(hidden_states, use_adaptive_early_exit=True)
+            ctm_output, _, _, _ = self.ctm(hidden_states, use_adaptive_early_exit=True)
             hidden_states, new_state = self.mamba_blocks[layer_idx].mamba(
                 hidden_states, mamba_states[layer_idx]
             )
@@ -274,7 +274,7 @@ class LunaUltimate(nn.Module):
         updated_kv_caches = []
         for layer_idx in range(self.mla_layers):
             global_idx = layer_idx + self.mamba2_layers
-            ctm_output, _, _ = self.ctm(hidden_states, use_adaptive_early_exit=True)
+            ctm_output, _, _, _ = self.ctm(hidden_states, use_adaptive_early_exit=True)
             hidden_states, new_kv = self.mla_blocks[layer_idx].attention(
                 hidden_states, kv_caches[layer_idx], use_int4_cache
             )
@@ -337,7 +337,7 @@ class LunaUltimate(nn.Module):
                 # Process full prompt for first step
                 hidden_states = self.embed_tokens(generated)
                 for layer_idx in range(self.mamba2_layers):
-                    ctm_output, _, _ = self.ctm(
+                    ctm_output, _, _, _ = self.ctm(
                         hidden_states, use_adaptive_early_exit=ctm_adaptive_early_exit
                     )
                     hidden_states, aux_loss, new_state = self.mamba_blocks[layer_idx](
@@ -349,7 +349,7 @@ class LunaUltimate(nn.Module):
 
                 for layer_idx in range(self.mla_layers):
                     global_idx = layer_idx + self.mamba2_layers
-                    ctm_output, _, _ = self.ctm(
+                    ctm_output, _, _, _ = self.ctm(
                         hidden_states, use_adaptive_early_exit=ctm_adaptive_early_exit
                     )
                     hidden_states, aux_loss, new_kv = self.mla_blocks[layer_idx](
@@ -400,7 +400,7 @@ class LunaUltimate(nn.Module):
                 mamba_states = current_mamba_states
             else:
                 # ========== Standard autoregressive ==========
-                ctm_output, _, _ = self.ctm(
+                ctm_output, _, _, _ = self.ctm(
                     last_hidden, use_adaptive_early_exit=ctm_adaptive_early_exit
                 )
 
@@ -415,7 +415,7 @@ class LunaUltimate(nn.Module):
 
                 for layer_idx in range(self.mla_layers):
                     global_idx = layer_idx + self.mamba2_layers
-                    ctm_output, _, _ = self.ctm(
+                    ctm_output, _, _, _ = self.ctm(
                         last_hidden, use_adaptive_early_exit=ctm_adaptive_early_exit
                     )
                     last_hidden, new_kv = self.mla_blocks[layer_idx].attention(
