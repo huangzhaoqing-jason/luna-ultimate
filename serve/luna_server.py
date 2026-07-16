@@ -127,6 +127,92 @@ class LunaEngine:
             "device": self.choice.name,
         }
 
+    @torch.no_grad()
+    def run_action(
+        self,
+        prompt: str,
+        execute: bool = False,
+        operator_token: Optional[str] = None,
+        workdir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """三段式 Action：M1→premotor→SMA→脑干动作门→(可选)执行器。"""
+        from action.action_gate import ActionGate
+        from action.executor import ActionExecutor
+        from modeling_motor import ActionSpec
+
+        # 文本门先过
+        allowed, reason = self.gate(f"action plan: {prompt}")
+        if not allowed:
+            return {"allowed": False, "reason": reason, "stage": "text_gate"}
+
+        ids = self._tokenize(prompt)
+        out = self.model(ids, route_text=prompt, return_all_losses=False)
+        motor = out.get("motor_actions")
+        if motor is None:
+            return {"allowed": False, "reason": "no motor plan", "stage": "motor"}
+        dag = motor["dag"]
+        gate = ActionGate(self.lock, require_operator_for_write=False)
+
+        # 对 DAG 每个节点过脑干动作门
+        decisions = []
+        for node in dag.nodes:
+            d = gate.gate(node, operator_token=operator_token,
+                          context={"intent": prompt[:200]})
+            decisions.append({
+                "name": node.name, "kind": node.kind,
+                "permission": d.permission, "allowed": d.allowed,
+                "reason": d.reason, "audit_id": d.audit_id,
+            })
+            if not d.allowed:
+                return {
+                    "allowed": False, "stage": "action_gate",
+                    "blocked_node": node.name, "decision": decisions[-1],
+                    "all_decisions": decisions,
+                    "thalamus_task": out.get("thalamus_task"),
+                    "wake": out.get("thalamus_wake"),
+                }
+
+        result: Dict[str, Any] = {
+            "allowed": True,
+            "stage": "planned",
+            "m1": motor["m1"],
+            "sma_hit": motor.get("sma_hit"),
+            "dag_nodes": [{"kind": n.kind, "name": n.name, "permission": n.permission,
+                           "args": n.args} for n in dag.nodes],
+            "decisions": decisions,
+            "thalamus_task": out.get("thalamus_task"),
+            "wake": out.get("thalamus_wake"),
+            "sub_regions": out.get("thalamus_sub_regions"),
+            "cache_hit": bool(out.get("cache_hit")),
+        }
+
+        if execute:
+            # 沙箱执行（默认不 push、不联网）
+            exec_ = ActionExecutor(
+                workdir=workdir or str(ROOT),
+                allow_network=False,
+                default_timeout=30.0,
+            )
+            results = exec_.execute_dag(dag)
+            result["executed"] = True
+            result["results"] = [
+                {"ok": r.ok, "name": r.name, "exit_code": r.exit_code,
+                 "stdout": r.stdout[:800], "stderr": r.stderr[:800]}
+                for r in results
+            ]
+            result["all_ok"] = all(r.ok for r in results)
+            # 海马体记录 episode
+            try:
+                self.model.hippocampus.remember(
+                    task=prompt, outcome="success" if result["all_ok"] else "fail",
+                    quality=1.0 if result["all_ok"] else 0.0,
+                    actions=[r.name for r in results],
+                )
+            except Exception:
+                pass
+
+        return result
+
     def _tokenize(self, text: str) -> torch.Tensor:
         # 无外部 tokenizer：字符/字节哈希映射到 vocab
         vs = self.cfg.vocab_size
@@ -208,7 +294,7 @@ def make_handler(preset: str, device: str):
                             "track": "native",
                             "device": eng.choice.name,
                             "backend": eng.choice.backend,
-                            "capabilities": ["llm", "vlm", "vla", "wa"],
+                            "capabilities": ["llm", "vlm", "vla", "wa", "action"],
                         },
                     }],
                     "version": "luna-serve-0.1",
@@ -280,6 +366,16 @@ def make_handler(preset: str, device: str):
                     result = eng.predict_action(prompt, images=data.get("images"))
                     self._json(200, result)
                     return
+                if path == "/api/action":
+                    prompt = data.get("prompt") or data.get("intent") or ""
+                    execute = bool(data.get("execute", False))
+                    operator_token = data.get("operator_token")
+                    result = eng.run_action(
+                        prompt, execute=execute, operator_token=operator_token,
+                        workdir=data.get("workdir"),
+                    )
+                    self._json(200, result)
+                    return
                 self._json(404, {"error": f"unknown path {path}"})
             except Exception as e:
                 self._json(500, {"error": str(e), "trace": traceback.format_exc()[-2000:]})
@@ -291,7 +387,7 @@ def serve(host: str = "127.0.0.1", port: int = 11435, preset: str = "tiny", devi
     handler = make_handler(preset, device)
     httpd = ThreadingHTTPServer((host, port), handler)
     print(f"[luna_serve] http://{host}:{port} preset={preset} device={device}")
-    print("[luna_serve] endpoints: GET /api/tags | POST /api/generate | /api/chat | /v1/chat/completions | /api/vla")
+    print("[luna_serve] endpoints: GET /api/tags | POST /api/generate | /api/chat | /v1/chat/completions | /api/vla | /api/action")
     httpd.serve_forever()
 
 

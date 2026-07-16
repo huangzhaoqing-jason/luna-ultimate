@@ -86,6 +86,37 @@ class LunaUltimateFused(nn.Module):
         self.collapse_detector = CollapseDetector()
         self.last_route_plan: Optional[RoutePlan] = None
 
+        # 脑区模块（按需接入；tiny 上轻量）
+        from modeling_cerebellum import CerebellarCorrector
+        from modeling_hippocampus import HippocampusModule
+        from modeling_parietal import ParietalReasoner
+        self.cerebellum = CerebellarCorrector(config)
+        self.hippocampus = HippocampusModule(config)
+        self.parietal = ParietalReasoner(config)
+        # 颞叶 RAG（内存占位）
+        try:
+            from rag import build_rag
+            self.rag = build_rag("memory")
+        except Exception:
+            self.rag = None
+        # 默认灌几条知识占位
+        if self.rag is not None and len(self.rag) == 0:
+            for t in [
+                "gradient descent minimizes loss",
+                "mamba2 ssd is o(1) state",
+                "git commit records a snapshot",
+                "lora low rank adaptation finetune",
+            ]:
+                self.rag.add(t)
+
+        # 运动动作中枢（M1/premotor/SMA）— 延迟导入避免循环
+        self.motor_enabled = bool(getattr(config, "motor_enabled", True))
+        if self.motor_enabled:
+            from modeling_motor import MotorCortex
+            self.motor = MotorCortex(config)
+        else:
+            self.motor = None
+
         # VLA / World-Action（可选能力面；默认开启轻量头）
         self.vla_enabled = bool(getattr(config, "vla_enabled", True))
         self.wa_enabled = bool(getattr(config, "wa_enabled", True))
@@ -179,6 +210,37 @@ class LunaUltimateFused(nn.Module):
         for m, k in zip(self.moe_layers, prev):
             m.top_k = k
 
+    def _apply_route(self, plan: Optional[RoutePlan]) -> Dict[str, object]:
+        """丘脑真调度：按 plan 设 CTM ticks / MoE top_k / layer-skip 等。
+
+        返回旧值字典，forward 结束后恢复。这是「低算力」核心路径。
+        """
+        prev: Dict[str, object] = {"moe_topk": [int(m.top_k) for m in self.moe_layers]}
+        if plan is None:
+            prev["ctm_max_ticks"] = self.ctm.max_ticks
+            prev["layer_skip_prob"] = self.config.layer_skip_prob_threshold
+            return prev
+        # MoE top_k
+        k = self.thalamus.expert_top_k(self.config, plan)
+        for m in self.moe_layers:
+            m.top_k = k
+        # CTM ticks 上限（运行时覆盖，不动 config 字段）
+        prev["ctm_max_ticks"] = self.ctm.max_ticks
+        self.ctm.max_ticks = max(1, min(plan.ctm_ticks, self.config.ctm_max_ticks))
+        # layer-skip 阈值（简单任务更激进跳层）
+        prev["layer_skip_prob"] = self.config.layer_skip_prob_threshold
+        if plan.enable_layer_skip:
+            self.config.layer_skip_prob_threshold = 0.3
+        else:
+            self.config.layer_skip_prob_threshold = 0.5
+        return prev
+
+    def _restore_route(self, prev: Dict[str, object]) -> None:
+        for m, k in zip(self.moe_layers, prev["moe_topk"]):
+            m.top_k = k
+        self.ctm.max_ticks = int(prev["ctm_max_ticks"])
+        self.config.layer_skip_prob_threshold = prev["layer_skip_prob"]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -206,14 +268,14 @@ class LunaUltimateFused(nn.Module):
         if use_int4_cache is None:
             use_int4_cache = bool(self.config.use_kv_cache_int4) and not self.training
 
-        # 丘脑：按任务类型缩放专家预算（简单任务少唤醒）
+        # 丘脑：按任务类型真调度（CTM ticks / MoE / layer-skip / 脑区开关）
         plan: Optional[RoutePlan] = None
         if route_text is not None:
             plan = self.thalamus.plan_from_text(route_text)
         elif compute_vla or visual_input is not None:
             plan = self.thalamus.plan_from_text("vision planning action")
         self.last_route_plan = plan
-        prev_topk = self._apply_expert_budget(plan)
+        prev_route = self._apply_route(plan)
 
         try:
             text_embeds = self.embed_tokens(input_ids)
@@ -228,96 +290,153 @@ class LunaUltimateFused(nn.Module):
             if visual_input is not None and self.vjepa is not None:
                 vjepa_features, vjepa_loss, _ = self.vjepa(visual_input)
 
-            if vjepa_features is not None:
-                hidden_states = torch.cat([vjepa_features, text_embeds], dim=1)
+            # —— 小脑缓存命中快路径（最省算力）——
+            cache_hit = None
+            if plan is not None and plan.cache_lookup and route_text:
+                cache_hit = self.cerebellum.lookup(route_text)
+            if cache_hit is not None:
+                # 命中：用缓存的 pooled hidden 直接走解码，跳过主干
+                cached = cache_hit.value.to(device=device, dtype=text_embeds.dtype)
+                if cached.dim() == 2:
+                    cached = cached.unsqueeze(0)
+                hidden_states = cached.expand(text_embeds.shape[0], -1, -1)
+                outputs["cache_hit"] = True
+                outputs["cache_hits"] = cache_hit.hits
             else:
-                hidden_states = text_embeds
+                # —— 颞叶 RAG 召回（knowledge/code）——
+                rag_prefix = None
+                if plan is not None and plan.enable_rag and self.rag is not None and route_text:
+                    hits = self.rag.search(route_text, k=2)
+                    if hits:
+                        # 把检索文本哈希成伪嵌入拼前缀（占位；真实走 embed）
+                        vs = self.config.vocab_size
+                        rag_ids = []
+                        for doc, _ in hits:
+                            for c in (doc.text or "")[:8]:
+                                rag_ids.append((ord(c) * 131 + 7) % vs)
+                        if rag_ids:
+                            rag_ids_t = torch.tensor([rag_ids], dtype=torch.long, device=device)
+                            rag_prefix = self.embed_tokens(rag_ids_t)
+                            outputs["rag_hits"] = [d.doc_id for d, _ in hits]
 
-            total_aux_loss = torch.zeros((), device=device)
-            total_ctmj_loss = torch.zeros((), device=device)
-            tick_list: List[int] = []
-            ctm_state = None
-            ctm_output = None
-            inject_every = max(1, self.ctm_inject_every)
-
-            # --- Mamba front ---
-            for layer_idx in range(self.mamba2_layers):
-                if ctm_output is None or (layer_idx % inject_every == 0):
-                    ctm_output, ctm_state, total_ctmj_loss = self._refresh_ctm(
-                        hidden_states,
-                        use_ctm_adaptive,
-                        return_jepa=return_all_losses,
-                        tick_list=tick_list,
-                        ctmj_acc=total_ctmj_loss,
-                    )
-
-                if use_dynamic_skip and ctm_state is not None:
-                    skip_mask = self._should_skip_layers(ctm_state, layer_idx)
-                    if bool(skip_mask.all()):
-                        continue
-
-                if self._grad_ckpt and self.training:
-                    hidden_states, aux_loss, _ = torch.utils.checkpoint.checkpoint(
-                        self.mamba_blocks[layer_idx],
-                        hidden_states,
-                        self.moe_layers[layer_idx],
-                        ctm_output,
-                        use_reentrant=False,
-                    )
+                if vjepa_features is not None:
+                    parts = [vjepa_features]
+                    if rag_prefix is not None:
+                        parts.append(rag_prefix)
+                    parts.append(text_embeds)
+                    hidden_states = torch.cat(parts, dim=1)
+                elif rag_prefix is not None:
+                    hidden_states = torch.cat([rag_prefix, text_embeds], dim=1)
                 else:
-                    hidden_states, aux_loss, _ = self.mamba_blocks[layer_idx](
-                        hidden_states, self.moe_layers[layer_idx], ctm_output
-                    )
-                total_aux_loss = total_aux_loss + aux_loss
+                    hidden_states = text_embeds
 
-            # --- MLA back ---
-            for layer_idx in range(self.mla_layers):
-                global_idx = layer_idx + self.mamba2_layers
-                if ctm_output is None or (global_idx % inject_every == 0):
-                    ctm_output, ctm_state, total_ctmj_loss = self._refresh_ctm(
-                        hidden_states,
-                        use_ctm_adaptive,
-                        return_jepa=return_all_losses,
-                        tick_list=tick_list,
-                        ctmj_acc=total_ctmj_loss,
-                    )
+                total_aux_loss = torch.zeros((), device=device)
+                total_ctmj_loss = torch.zeros((), device=device)
+                tick_list: List[int] = []
+                ctm_state = None
+                ctm_output = None
+                inject_every = max(1, self.ctm_inject_every)
 
-                if use_dynamic_skip and ctm_state is not None:
-                    skip_mask = self._should_skip_layers(ctm_state, global_idx)
-                    if bool(skip_mask.all()):
-                        continue
+                # layer-skip 由丘脑开关决定
+                dyn_skip = use_dynamic_skip or (plan is not None and plan.enable_layer_skip)
 
-                if self._grad_ckpt and self.training:
-                    hidden_states, aux_loss, _ = torch.utils.checkpoint.checkpoint(
-                        self.mla_blocks[layer_idx],
-                        hidden_states,
-                        self.moe_layers[global_idx],
-                        ctm_output,
-                        None,
-                        use_int4_cache,
-                        use_reentrant=False,
-                    )
-                else:
-                    hidden_states, aux_loss, _ = self.mla_blocks[layer_idx](
-                        hidden_states,
-                        self.moe_layers[global_idx],
-                        ctm_output,
-                        kv_cache=None,
-                        use_int4_cache=use_int4_cache,
-                    )
-                total_aux_loss = total_aux_loss + aux_loss
+                # --- Mamba front ---
+                for layer_idx in range(self.mamba2_layers):
+                    if ctm_output is None or (layer_idx % inject_every == 0):
+                        ctm_output, ctm_state, total_ctmj_loss = self._refresh_ctm(
+                            hidden_states,
+                            use_ctm_adaptive,
+                            return_jepa=return_all_losses,
+                            tick_list=tick_list,
+                            ctmj_acc=total_ctmj_loss,
+                        )
 
-            hidden_states = self.final_norm(hidden_states)
+                    if dyn_skip and ctm_state is not None:
+                        skip_mask = self._should_skip_layers(ctm_state, layer_idx)
+                        if bool(skip_mask.all()):
+                            continue
+
+                    if self._grad_ckpt and self.training:
+                        hidden_states, aux_loss, _ = torch.utils.checkpoint.checkpoint(
+                            self.mamba_blocks[layer_idx],
+                            hidden_states,
+                            self.moe_layers[layer_idx],
+                            ctm_output,
+                            use_reentrant=False,
+                        )
+                    else:
+                        hidden_states, aux_loss, _ = self.mamba_blocks[layer_idx](
+                            hidden_states, self.moe_layers[layer_idx], ctm_output
+                        )
+                    total_aux_loss = total_aux_loss + aux_loss
+
+                # --- MLA back ---
+                for layer_idx in range(self.mla_layers):
+                    global_idx = layer_idx + self.mamba2_layers
+                    if ctm_output is None or (global_idx % inject_every == 0):
+                        ctm_output, ctm_state, total_ctmj_loss = self._refresh_ctm(
+                            hidden_states,
+                            use_ctm_adaptive,
+                            return_jepa=return_all_losses,
+                            tick_list=tick_list,
+                            ctmj_acc=total_ctmj_loss,
+                        )
+
+                    if dyn_skip and ctm_state is not None:
+                        skip_mask = self._should_skip_layers(ctm_state, global_idx)
+                        if bool(skip_mask.all()):
+                            continue
+
+                    if self._grad_ckpt and self.training:
+                        hidden_states, aux_loss, _ = torch.utils.checkpoint.checkpoint(
+                            self.mla_blocks[layer_idx],
+                            hidden_states,
+                            self.moe_layers[global_idx],
+                            ctm_output,
+                            None,
+                            use_int4_cache,
+                            use_reentrant=False,
+                        )
+                    else:
+                        hidden_states, aux_loss, _ = self.mla_blocks[layer_idx](
+                            hidden_states,
+                            self.moe_layers[global_idx],
+                            ctm_output,
+                            kv_cache=None,
+                            use_int4_cache=use_int4_cache,
+                        )
+                    total_aux_loss = total_aux_loss + aux_loss
+
+                hidden_states = self.final_norm(hidden_states)
+
+                # —— 海马体残差注入（reasoning/action）——
+                if plan is not None and plan.enable_hippo:
+                    hidden_states = hidden_states + self.hippocampus(hidden_states) * 0.1
+
+                # —— 小脑纠错（默认开，轻量）——
+                if plan is None or plan.enable_cerebellum:
+                    hidden_states = self.cerebellum(hidden_states)
+
+                # —— 顶叶校验（math/code）——
+                if plan is not None and plan.enable_parietal and route_text:
+                    pv = self.parietal.reason(hidden=hidden_states, text=route_text)
+                    outputs["parietal_verify"] = pv  # type: ignore[assignment]
+
+                # 写小脑缓存（仅在有 route_text 时）
+                if route_text and (plan is None or plan.enable_cerebellum):
+                    self.cerebellum.store(route_text, hidden_states.mean(dim=1).detach())
 
             # 默认 meaning_first：目标语义调制 logits（无 AR fallback）
             target_meaning = None
             recon_loss = torch.zeros((), device=device)
             if mode == "meaning_first":
-                # 仅用文本段做意义规划（跳过视觉前缀）
+                # 仅用文本段做意义规划（跳过视觉/RAG 前缀）
+                prefix = 0
                 if vjepa_features is not None:
-                    prompt_h = hidden_states[:, vjepa_features.shape[1] :, :]
-                else:
-                    prompt_h = hidden_states
+                    prefix += vjepa_features.shape[1]
+                if outputs.get("rag_hits"):
+                    prefix += rag_prefix.shape[1]  # type: ignore[union-attr]
+                prompt_h = hidden_states[:, prefix:, :] if prefix else hidden_states
                 target_meaning = self.meaning_planner.plan(prompt_h)
                 md_out = self.meaning_decoder(
                     hidden_states,
@@ -339,6 +458,9 @@ class LunaUltimateFused(nn.Module):
             if plan is not None:
                 outputs["expert_budget"] = torch.tensor(plan.expert_budget, device=device)
                 outputs["thalamus_task"] = plan.task_type.value
+                outputs["thalamus_wake"] = sorted(plan.wake)
+                outputs["thalamus_sub_regions"] = plan.sub_regions
+                outputs["ctm_ticks_plan"] = plan.ctm_ticks
 
             # VLA / World-Action 头（按需）
             if compute_vla and self.action_head is not None:
@@ -362,7 +484,12 @@ class LunaUltimateFused(nn.Module):
                 if wa_out.world_loss is not None:
                     outputs["world_loss"] = wa_out.world_loss
 
-            avg_ticks = float(sum(tick_list) / max(1, len(tick_list)))
+            # 运动动作中枢（M1/premotor/SMA）— 仅产出 ActionSpec，执行在 serve/action/
+            if plan is not None and plan.enable_action and self.motor is not None and route_text:
+                motor_out = self.motor.plan_actions(hidden_states, intent=route_text)
+                outputs["motor_actions"] = motor_out  # type: ignore[assignment]
+
+            avg_ticks = float(sum(tick_list) / max(1, len(tick_list))) if not outputs.get("cache_hit") else 0.0
             self.last_avg_ticks = avg_ticks
             outputs["avg_ticks"] = torch.tensor(avg_ticks, device=device)
 
@@ -376,7 +503,7 @@ class LunaUltimateFused(nn.Module):
                 outputs["moe_loss"] = total_aux_loss
                 outputs["lm_logits"] = text_logits
         finally:
-            self._restore_expert_budget(prev_topk)
+            self._restore_route(prev_route)
 
         return outputs
 
