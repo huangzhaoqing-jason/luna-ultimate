@@ -178,10 +178,31 @@ def register_cann_backends():
     return False
 
 
+def smoke_probe() -> dict:
+    """CANN 冒烟：有 torch_npu 则探测；否则诚实报告 CPU 回退。"""
+    import torch
+    if not HAS_CANN:
+        return {
+            "ok": True,
+            "available": False,
+            "detail": "torch_npu/CANN not installed; luna serve --device cann → cpu fallback",
+        }
+    try:
+        x = torch.randn(1, 4, 8)
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            x = x.to("npu:0")
+            y = x + 1
+            return {"ok": True, "available": True, "device": str(y.device)}
+        return {"ok": True, "available": True, "detail": "torch_npu imported; npu not available"}
+    except Exception as e:
+        return {"ok": False, "available": True, "error": str(e)}
+
+
 __all__ = [
     "mamba2_scan_cann",
     "flash_attention_cann",
     "moe_gate_cann",
     "register_cann_backends",
+    "smoke_probe",
     "HAS_CANN",
 ]

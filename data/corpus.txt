@@ -1,0 +1,5 @@
+gradient descent minimizes loss
+mamba2 selective scan is efficient
+prove by induction that n squared grows
+def fib(n): return n if n < 2 else fib(n-1)+fib(n-2)
+git commit records a snapshot

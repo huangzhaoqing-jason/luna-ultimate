@@ -1,0 +1,52 @@
+{
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 16,
+  "gradient_clipping": 1.0,
+  "steps_per_print": 10,
+  "zero_optimization": {
+    "stage": 3,
+    "offload_param": {
+      "device": "cpu",
+      "pin_memory": true
+    },
+    "offload_optimizer": {
+      "device": "cpu",
+      "pin_memory": true
+    },
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "sub_group_size": 1e9,
+    "reduce_bucket_size": 5e8,
+    "stage3_prefetch_bucket_size": 5e8,
+    "stage3_param_persistence_threshold": 1e6
+  },
+  "bf16": {
+    "enabled": true
+  },
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": 1e-4,
+      "betas": [0.9, 0.95],
+      "eps": 1e-8,
+      "weight_decay": 0.1
+    }
+  },
+  "scheduler": {
+    "type": "WarmupCosineLR",
+    "params": {
+      "warmup_min_lr": 1e-6,
+      "warmup_max_lr": 1e-4,
+      "warmup_num_steps": 2000,
+      "total_num_steps": 100000
+    }
+  },
+  "wall_clock_breakdown": false,
+  "luna_notes": {
+    "preset": "550b",
+    "active_params_target_b": 77,
+    "moe_ep": "enable expert-parallel when available",
+    "policy": "Only launch after evolve archive stable on 1b/7b"
+  }
+}

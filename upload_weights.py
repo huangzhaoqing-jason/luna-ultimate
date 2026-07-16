@@ -46,8 +46,8 @@ def parse_args():
                         help="ModelScope namespace (default: your username)")
     parser.add_argument("--token", type=str, default=None,
                         help="ModelScope SDK token (or set MODELSCOPE_SDK_TOKEN env var)")
-    parser.add_argument("--revision", type=str, default="main",
-                        help="Git revision to push to")
+    parser.add_argument("--revision", type=str, default="master",
+                        help="Git revision to push to (ModelScope default is often master)")
     parser.add_argument("--shard_size_gb", type=float, default=5.0,
                         help="Target shard size in GB (default: 5)")
     parser.add_argument("--dry_run", action="store_true",
@@ -55,6 +55,17 @@ def parse_args():
     parser.add_argument("--message", type=str, default=None,
                         help="Commit message for the upload")
     return parser.parse_args()
+
+
+def _prepare_weights_for_export(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Drop accidental nested CTM copies and clone shared storages for safetensors."""
+    cleaned: Dict[str, torch.Tensor] = {}
+    for name, tensor in weights.items():
+        if name.startswith("jepa_controller.ctm."):
+            continue
+        # meaning_decoder.lm_head 与 embed_tokens 权重绑定；clone 避免 safetensors 共享内存报错
+        cleaned[name] = tensor.detach().cpu().contiguous().clone()
+    return cleaned
 
 
 def load_model_weights(model_path: str) -> Dict[str, torch.Tensor]:
@@ -70,7 +81,7 @@ def load_model_weights(model_path: str) -> Dict[str, torch.Tensor]:
     if not path.exists():
         raise FileNotFoundError(f"Model path not found: {model_path}")
 
-    weights = {}
+    weights: Dict[str, torch.Tensor] = {}
 
     # Try safetensors first
     safe_files = sorted(path.glob("*.safetensors"))
@@ -78,22 +89,34 @@ def load_model_weights(model_path: str) -> Dict[str, torch.Tensor]:
         from safetensors.torch import load_file as safe_load
         for f in safe_files:
             weights.update(safe_load(str(f)))
-        return weights
+        return _prepare_weights_for_export(weights)
+
+    # Prefer .pt train checkpoints over intermediate .bin exports
+    pt_files = list(path.glob("*.pt")) + list(path.glob("*.pth"))
+    if pt_files:
+        checkpoint = torch.load(str(pt_files[0]), map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, dict):
+            if "model_state_dict" in checkpoint:
+                return _prepare_weights_for_export(checkpoint["model_state_dict"])
+            if "model" in checkpoint:
+                return _prepare_weights_for_export(checkpoint["model"])
+            if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+                return _prepare_weights_for_export(checkpoint)
+            raise ValueError(
+                f"Unrecognized checkpoint keys in {pt_files[0]}: {list(checkpoint.keys())[:12]}"
+            )
+        return _prepare_weights_for_export(checkpoint)
 
     # Try pytorch .bin files
     bin_files = sorted(path.glob("*.bin"))
     if bin_files:
         for f in bin_files:
-            weights.update(torch.load(str(f), map_location="cpu"))
-        return weights
-
-    # Try .pt checkpoint
-    pt_files = list(path.glob("*.pt")) + list(path.glob("*.pth"))
-    if pt_files:
-        checkpoint = torch.load(str(pt_files[0]), map_location="cpu")
-        if isinstance(checkpoint, dict) and "model" in checkpoint:
-            return checkpoint["model"]
-        return checkpoint
+            loaded = torch.load(str(f), map_location="cpu", weights_only=False)
+            if isinstance(loaded, dict) and "model_state_dict" in loaded:
+                weights.update(loaded["model_state_dict"])
+            else:
+                weights.update(loaded)
+        return _prepare_weights_for_export(weights)
 
     raise FileNotFoundError(f"No weight files found in {model_path}")
 
@@ -230,48 +253,60 @@ def save_sharded_bin(
     return saved_files
 
 
-def get_model_config() -> dict:
-    """Build model config dict for ModelScope."""
+def get_model_config(model_path: Optional[str] = None) -> dict:
+    """Build model config dict for ModelScope.
+
+    Prefer ``config.json`` next to weights (e.g. tiny champion); else LunaConfig defaults.
+    """
     from config import LunaConfig
+
+    if model_path:
+        cfg_file = Path(model_path) / "config.json"
+        if cfg_file.exists():
+            raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+            raw.setdefault("model_type", "luna_ultimate")
+            raw.setdefault("architectures", ["LunaUltimateFused"])
+            return raw
+
     config = LunaConfig()
     return {
         "model_type": "luna_ultimate",
         "architectures": ["LunaUltimateFused"],
+        "preset_name": config.preset_name,
         "hidden_size": config.hidden_size,
         "num_hidden_layers": config.num_hidden_layers,
         "mamba2_layers": config.mamba2_layers,
         "mla_layers": config.mla_layers,
-        "num_attention_heads": config.num_attention_heads,
-        "num_key_value_heads": config.num_key_value_heads,
+        "n_heads": config.n_heads,
         "intermediate_size": config.intermediate_size,
         "vocab_size": config.vocab_size,
         "max_position_embeddings": config.max_position_embeddings,
         "rms_norm_eps": config.rms_norm_eps,
-        "tie_word_embeddings": config.tie_word_embeddings,
+        "tie_word_embeddings": True,
         # MoE
         "num_routed_experts": config.num_routed_experts,
         "num_shared_experts": config.num_shared_experts,
-        "num_experts_per_tok": config.num_experts_per_tok,
-        "expert_hidden_size": config.expert_hidden_size,
+        "num_expert_activated": config.num_expert_activated,
         # Mamba2
-        "d_state": config.d_state,
-        "d_conv": config.d_conv,
-        "expand": config.expand,
+        "mamba_d_state": config.mamba_d_state,
+        "mamba_d_conv": config.mamba_d_conv,
+        "mamba_expand": config.mamba_expand,
         # MLA
         "q_lora_rank": config.q_lora_rank,
         "kv_lora_rank": config.kv_lora_rank,
         "qk_nope_head_dim": config.qk_nope_head_dim,
         "qk_rope_head_dim": config.qk_rope_head_dim,
         "v_head_dim": config.v_head_dim,
-        # CTM
+        # CTM / JEPA 总控
         "ctm_n_neurons": config.ctm_n_neurons,
         "ctm_nlm_hidden": config.ctm_nlm_hidden,
         "ctm_max_ticks": config.ctm_max_ticks,
-        "ctm_jepa_enabled": getattr(config, "ctm_jepa_enabled", True),
-        "ctm_jepa_horizon": getattr(config, "ctm_jepa_horizon", 1),
-        "ctm_jepa_ema_decay": getattr(config, "ctm_jepa_ema_decay", 0.996),
-        # V-JEPA
-        "vjepa_config": getattr(config, "vjepa_config", {}),
+        "ctm_jepa_enabled": config.ctm_jepa_enabled,
+        "ctm_jepa_horizon": config.ctm_jepa_horizon,
+        "ctm_jepa_ema_decay": config.ctm_jepa_ema_decay,
+        "jepa_control_enabled": config.jepa_control_enabled,
+        "route_mode": config.route_mode,
+        "vjepa_config": config.vjepa_config,
     }
 
 
@@ -285,24 +320,28 @@ def upload_to_modelscope(
 ):
     """Upload files to ModelScope Hub."""
     if token is None:
-        token = os.environ.get("MODELSCOPE_SDK_TOKEN")
+        token = os.environ.get("MODELSCOPE_SDK_TOKEN") or os.environ.get("MODELSCOPE_TOKEN")
     if token is None:
         print("ERROR: No ModelScope token provided.")
-        print("Set MODELSCOPE_SDK_TOKEN env variable or use --token flag.")
+        print("Set MODELSCOPE_TOKEN / MODELSCOPE_SDK_TOKEN or use --token flag.")
         print("Get your token at: https://modelscope.cn/my/myaccesstoken")
         sys.exit(1)
 
     os.environ["MODELSCOPE_SDK_TOKEN"] = token
+    os.environ["MODELSCOPE_TOKEN"] = token
 
     try:
         from modelscope.hub.api import HubApi
-        from modelscope.hub.repository import Repository
     except ImportError:
         print("ERROR: modelscope not installed.")
         print("Install with: pip install modelscope")
         sys.exit(1)
 
     api = HubApi()
+    try:
+        api.login(token)
+    except Exception as e:
+        print(f"Warning: api.login failed ({e}); continuing with env token")
 
     if namespace is None:
         user_info = api.get_user_info()
@@ -317,37 +356,82 @@ def upload_to_modelscope(
         api.create_model(
             model_id=full_repo,
             visibility="public",
-            license="Apache 2.0",
+            license="Apache License 2.0",
         )
         print(f"Created repo: {full_repo}")
     except Exception as e:
-        if "already exists" in str(e) or "409" in str(e):
+        err = str(e).lower()
+        if "already exists" in err or "409" in err or "exist" in err:
             print(f"Repo already exists: {full_repo}")
         else:
-            print(f"Warning: {e}")
+            print(f"Warning creating repo: {e}")
 
-    # Upload files
+    # ModelScope 新建仓默认分支多为 master（不是 main）
+    try:
+        valid = api.get_valid_revision(full_repo)
+        if valid:
+            revision = valid
+            print(f"  using revision: {revision}")
+    except Exception:
+        pass
+
+    # Hub 兼容：同时提供 configuration.json
     local_path = Path(local_dir)
-    files = sorted(local_path.glob("**/*"))
-    files = [f for f in files if f.is_file()]
+    cfg = local_path / "config.json"
+    conf = local_path / "configuration.json"
+    if cfg.exists() and not conf.exists():
+        conf.write_text(cfg.read_text(encoding="utf-8"), encoding="utf-8")
 
-    total = sum(f.stat().st_size for f in files)
-    uploaded = 0
-
-    for f in files:
-        rel_path = f.relative_to(local_path)
-        size_mb = f.stat().st_size / (1024 * 1024)
-        print(f"  Uploading {rel_path} ({size_mb:.1f} MB)...")
-
-        api.upload_file(
-            path_or_fileobj=str(f),
-            path_in_repo=str(rel_path),
+    print(f"  push_model from {local_dir} …")
+    pushed = False
+    try:
+        api.push_model(
             model_id=full_repo,
+            model_dir=local_dir,
+            commit_message=message or f"Upload {repo_name} weights",
             revision=revision,
-            message=message,
         )
-        uploaded += f.stat().st_size
-        print(f"    Progress: {uploaded / (1024 ** 3):.1f} / {total / (1024 ** 3):.1f} GB")
+        pushed = True
+    except TypeError:
+        api.push_model(
+            model_id=full_repo,
+            model_dir=local_dir,
+            commit_message=message or f"Upload {repo_name} weights",
+        )
+        pushed = True
+    except Exception as e:
+        print(f"push_model failed ({e}); fallback upload_folder …")
+        try:
+            api.upload_folder(
+                repo_id=full_repo,
+                folder_path=local_dir,
+                revision=revision,
+                commit_message=message or f"Upload {repo_name} weights",
+                token=token,
+            )
+            pushed = True
+        except Exception as e2:
+            print(f"ERROR: upload_folder also failed: {e2}")
+            sys.exit(1)
+
+    # 校验：远端应有权重文件
+    try:
+        try:
+            remote_files = api.get_model_files(full_repo, revision=revision)
+        except TypeError:
+            remote_files = api.get_model_files(full_repo)
+        names = {f.get("Path") or f.get("Name") for f in remote_files}
+        has_weights = any(
+            n.endswith(".safetensors") or n.endswith(".bin") for n in names if n
+        )
+        if not has_weights:
+            print(f"ERROR: remote has no weight files: {sorted(names)[:20]}")
+            sys.exit(1)
+        print(f"  verified remote files: {len(names)} (weights present)")
+    except Exception as e:
+        print(f"WARNING: could not verify remote files: {e}")
+        if not pushed:
+            sys.exit(1)
 
     print(f"\nUpload complete: {full_repo}")
     print(f"View at: https://modelscope.cn/models/{full_repo}")
@@ -387,10 +471,11 @@ def main():
 
     # Step 2: Prepare config
     print("\n[2/4] Building model config...")
-    config = get_model_config()
-    print(f"  Model type: {config['model_type']}")
-    print(f"  Hidden size: {config['hidden_size']}")
-    print(f"  Layers: {config['num_hidden_layers']}")
+    config = get_model_config(args.model_path)
+    print(f"  Model type: {config.get('model_type')}")
+    print(f"  Hidden size: {config.get('hidden_size')}")
+    print(f"  Layers: {config.get('num_hidden_layers')}")
+    print(f"  Preset: {config.get('preset_name', 'unknown')}")
 
     # Step 3: Save sharded weights
     output_dir = "/tmp/luna_upload"
@@ -401,36 +486,23 @@ def main():
     # Copy tokenizer
     prepare_tokenizer(args.model_path, output_dir)
 
-    # Write README for ModelScope
+    # Write README for ModelScope（与 GitHub 仓库名对齐）
+    preset = config.get("preset_name", "unknown")
     readme_path = Path(output_dir) / "README.md"
-    readme_path.write_text("""# Luna-Ultimate 550B
+    readme_path.write_text(f"""---
+license: Apache License 2.0
+---
+# Luna-Ultimate
 
-The world's first CTM × Mamba2-SSD × MLA × FlashMoE hybrid architecture.
+GitHub: https://github.com/huangzhaoqing-jason/luna-ultimate
 
-550B total / 80B active parameters.
-
-## Architecture
-- **Layers 1-12**: Mamba2-SSD (no KV Cache)
-- **Layers 13-32**: MLA (KV compression to 1024-dim)
-- **All 32**: FlashMoE (48 routed + 2 shared experts, Top-4)
-- **Global**: CTM (4096-neuron recurrent, 1-4 adaptive ticks)
+本仓库权重对应代码仓 `luna-ultimate`。当前上传 preset：`{preset}`（研究原型/烟测权重，不等于 550B 全量）。
 
 ## Quick Start
 ```python
 from modelscope import snapshot_download
-from config import LunaConfig
-from modeling_luna_ultimate import LunaUltimateFused
-
-# Download weights
-model_dir = snapshot_download("NAMESPACE/luna-ultimate-550b")
-
-# Load model
-config = LunaConfig()
-model = LunaUltimateFused(config)
-model.load_state_dict_from_safetensors(model_dir)
+model_dir = snapshot_download("huang18928827157/luna-ultimate")
 ```
-
-GitHub: https://github.com/huangzhaoqing-jason/luna-ultimate
 """)
 
     # Step 4: Upload

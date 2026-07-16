@@ -4,6 +4,10 @@ __pycache__/
 *.pth
 *.bin
 checkpoints/
+export/out/
+.luna/
+evolve_runs/
+eval_proxy.json
 wandb/
 .DS_Store
 *.egg-info/
