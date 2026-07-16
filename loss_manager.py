@@ -200,9 +200,10 @@ class StageAwareLossManager:
         self.stage = stage
         self.use_uncertainty = use_uncertainty
 
-        # Stage-specific static weights
+        # Stage-specific static weights (Luna Evolve)
+        # Stage 1: text LM pretrain; Stage 2: +CTM-JEPA; Stage 3: multimodal
         self.stage_weights = {
-            1: {"lm": 0.0, "vjepa": 1.0, "ctmj": 0.0, "moe": 0.0},
+            1: {"lm": 1.0, "vjepa": 0.0, "ctmj": 0.0, "moe": 0.01},
             2: {"lm": 1.0, "vjepa": 0.0, "ctmj": 0.1, "moe": 0.01},
             3: {"lm": 1.0, "vjepa": 0.05, "ctmj": 0.05, "moe": 0.01},
         }
@@ -242,16 +243,21 @@ class StageAwareLossManager:
 
         # Fallback: static weights
         weights = self.get_stage_weights()
-        total_loss = torch.tensor(0.0)
+        device = None
+        for v in losses.values():
+            if torch.is_tensor(v):
+                device = v.device
+                break
+        total_loss = torch.zeros((), device=device) if device is not None else torch.tensor(0.0)
         stats = {}
 
         for name, weight in weights.items():
             if name in losses and losses[name] is not None and weight > 0:
                 total_loss = total_loss + weight * losses[name]
-                stats[f"{name}_loss"] = losses[name].item()
+                stats[f"{name}_loss"] = float(losses[name].detach().item())
                 stats[f"{name}_weight"] = weight
 
-        stats["total_loss"] = total_loss.item()
+        stats["total_loss"] = float(total_loss.detach().item())
         stats["stage"] = float(self.stage)
         return total_loss, stats
 
@@ -267,16 +273,16 @@ class StageAwareLossManager:
             Dict mapping stage → module name pattern to freeze.
         """
         return {
-            1: "vjepa",            # Stage 1: freeze all except V-JEPA
-            2: "vjepa",            # Stage 2: freeze V-JEPA, train rest
+            1: "vjepa",            # Stage 1: freeze V-JEPA, train text LM
+            2: "vjepa",            # Stage 2: freeze V-JEPA, train + CTM-JEPA
             3: "",                 # Stage 3: train everything
         }
 
     def get_trainable_pattern(self) -> str:
         """Get pattern for modules that should be trainable at current stage."""
         if self.stage == 1:
-            return "vjepa"       # Only V-JEPA
+            return "embed,mamba,mla,moe,lm_head"
         elif self.stage == 2:
-            return "ctm,mla,mamba,moe,embed,lm_head"  # Backbone + CTM-JEPA
+            return "ctm,mla,mamba,moe,embed,lm_head"
         else:
-            return ""             # Everything
+            return ""
