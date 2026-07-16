@@ -105,7 +105,7 @@ pip install -r requirements.txt
 ```bash
 # Download 550B weights from ModelScope (China mirror, fast)
 python download_weights.py \
-    --repo huangzhaoqing-jason/luna-ultimate-550b \
+    --repo huang18928827157/luna-ultimate-550b \
     --output ./checkpoints
 ```
 
@@ -114,7 +114,7 @@ Or via Python:
 ```python
 from modelscope import snapshot_download
 
-model_dir = snapshot_download("huangzhaoqing-jason/luna-ultimate-550b")
+model_dir = snapshot_download("huang18928827157/luna-ultimate-550b")
 ```
 
 ### Model Initialization

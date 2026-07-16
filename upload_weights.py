@@ -42,7 +42,7 @@ def parse_args():
                         help="Path to model checkpoint directory")
     parser.add_argument("--repo_name", type=str, default="luna-ultimate-550b",
                         help="ModelScope repo name")
-    parser.add_argument("--namespace", type=str, default=None,
+    parser.add_argument("--namespace", type=str, default="huang18928827157",
                         help="ModelScope namespace (default: your username)")
     parser.add_argument("--token", type=str, default=None,
                         help="ModelScope SDK token (or set MODELSCOPE_SDK_TOKEN env var)")

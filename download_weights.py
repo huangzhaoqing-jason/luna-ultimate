@@ -29,7 +29,7 @@ def parse_args():
     )
     parser.add_argument(
         "--repo", type=str,
-        default="huangzhaoqing-jason/luna-ultimate-550b",
+        default="huang18928827157/luna-ultimate-550b",
         help="ModelScope repo name (namespace/model_name)"
     )
     parser.add_argument(
