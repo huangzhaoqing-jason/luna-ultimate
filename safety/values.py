@@ -75,7 +75,7 @@ def verify_values(stored_hash: str | None = None) -> str:
 _ANTI_VALUES_PATTERNS: List[str] = [
     r"\b(genocide|ethnic cleansing)\b",
     r"\b(hate speech|incite (violence|hatred))\b",
-    r"\b(dehumaniz|subjugat)""",
+    r"\b(dehumaniz|subjugat)\w*",
     r"\b(deny .{0,20}(medical care|humanitarian aid|food|water))\b",
     r"\b(attack|invade|occupy) .{0,20}(civilian|sovereign)\b",
     r"\b(discriminate .{0,12}(race|religion|gender|disability|nationality))\b",

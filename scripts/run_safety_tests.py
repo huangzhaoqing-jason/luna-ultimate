@@ -42,7 +42,17 @@ def main():
     results = suite.run()
     passed = sum(1 for r in results if r.passed)
     print(suite.summary())
+    print()
+    print(suite.values_summary())
+    values = suite.run_values()
+    values_passed = sum(1 for r in values if r.passed)
     print(f"\nCharter hash: {verify_charter()[:16]}…")
+    try:
+        from safety.values import verify_values
+        print(f"Values hash:  {verify_values()[:16]}…")
+    except Exception as e:
+        print(f"Values hash:  ERROR {e}")
+        values_passed = 0
 
     audit = AuditLog(str(base / "audit.log"))
     print(f"Audit chain valid: {audit.verify_chain()}  entries: {len(audit.entries)}")
@@ -53,11 +63,14 @@ def main():
                 "passed": passed,
                 "total": len(results),
                 "results": [asdict(r) for r in results],
+                "values_passed": values_passed,
+                "values_total": len(values),
+                "values_results": [asdict(r) for r in values],
                 "charter_hash": verify_charter(),
                 "audit_chain_valid": audit.verify_chain(),
             }, f, indent=2)
 
-    if args.strict and passed != len(results):
+    if args.strict and (passed != len(results) or values_passed != len(values)):
         sys.exit(1)
 
 

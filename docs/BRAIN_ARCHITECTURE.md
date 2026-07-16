@@ -11,13 +11,15 @@ it at the highest performance-per-FLOP, and run the whole stack on the
 
 | Brain region | Function | Luna module | Why this module (perf-per-FLOP) |
 |---|---|---|---|
-| Prefrontal cortex | Executive function, deliberation, planning | `CTM` (1-4 adaptive ticks) | Adaptive compute: simple → 1 tick, hard → 4. Pays only when needed. |
-| Hippocampus | Episodic memory, recall | `MLA` (latent KV compression) | Compressed KV = long memory at low VRAM; YaRN → 128K context. |
-| Cerebellum | Fast habitual / sequential processing | `Mamba2-SSD` | O(1) state, no KV growth → cheapest long-context encode. |
-| Thalamus | Sensory relay / routing | `FlashMoE` router | Top-K gate = sparse relay; only K experts fire. |
-| Cortex columns | Specialized capabilities | `FlashMoE` experts | Sparse MoE: huge total capacity, small active cost. |
+| Prefrontal cortex | Executive function, deliberation, planning | `CTM` + `MeaningPlanner` | Adaptive ticks + target-meaning plan before act. |
+| Hippocampus | Episodic memory, recall | `modeling_hippocampus` + `MLA` | Episodes/LoRA + compressed KV for long recall. |
+| Cerebellum | Fast habitual / sequential processing | `modeling_cerebellum` + `Mamba2-SSD` | LRU skill cache + O(1) state encode. |
+| Parietal | Spatial / numeric / symbolic | `modeling_parietal` | Neural intuition + lightweight AST verify. |
+| Thalamus | Sensory relay / routing (GWT) | `modeling_thalamus.ThalamusRouter` | Task-type wake + expert budget (~10–100%). |
+| Cortex columns | Specialized capabilities | `FlashMoE` experts + `rag/` | Sparse MoE + retrieval for knowledge tasks. |
 | Amygdala | Threat / safety detection | `SafetyCTM` | Cognitive safety loop: predicts consequence, refuses threats. |
-| Basal ganglia | Action selection / go-no-go | `SafetyLock.gate` | The single decision gate: allow/refuse. |
+| Basal ganglia | Action selection / go-no-go | `SafetyLock.gate` | Triple floor: charter OR values OR ctm refuse. |
+| Language areas | Speech / token output | `MeaningFirstDecoder` (Q1B, no AR fallback) | Decode from JEPA target meaning; collapse marked only. |
 | Corpus callosum | Inter-region integration | CTM residual injection | Global CTM state broadcast to every layer. |
 | Sensory cortex | Perception | `V-JEPA` + `ActionEncoder` | JEPA world model + text encoder = sensory front. |
 | Mirror neurons / empathy | Align with others' welfare | `ValuesCharter` + `ForbiddenPrototypeSet` | Values floor + anti-humanitarian prototypes → prosocial gating. |
@@ -27,22 +29,26 @@ it at the highest performance-per-FLOP, and run the whole stack on the
 ```mermaid
 flowchart TB
   Sense["Sensory cortex (V-JEPA / ActionEncoder)"]
-  Cereb["Cerebellum (Mamba2-SSD front)"]
-  Hippo["Hippocampus (MLA back)"]
-  PFC["Prefrontal cortex (CTM adaptive ticks)"]
-  Thal["Thalamus (FlashMoE router)"]
-  Col["Cortex columns (FlashMoE experts)"]
+  Thal["Thalamus (dynamic route + expert budget)"]
+  Cereb["Cerebellum (cache + Mamba2 front)"]
+  Hippo["Hippocampus (episodes + MLA back)"]
+  Parietal["Parietal (neuro-symbolic)"]
+  PFC["Prefrontal (CTM + MeaningPlanner)"]
+  Col["Cortex columns (FlashMoE + RAG)"]
+  Decode["MeaningFirstDecoder (no AR fallback)"]
   Amyg["Amygdala (SafetyCTM)"]
   BG["Basal ganglia (SafetyLock gate)"]
   Emp["Empathy (ValuesCharter + prototypes)"]
-  Out["Motor / speech output (LM head)"]
+  Out["Motor / speech output"]
 
-  Sense --> Cereb --> Hippo --> Out
+  Sense --> Thal --> Cereb --> Hippo --> Decode
+  Thal --> Parietal
+  Thal --> Col
+  PFC -->|target meaning| Decode
   PFC -->|residual every N layers| Cereb
-  PFC -->|residual every N layers| Hippo
-  Thal --> Col --> Hippo
   Amyg --> BG
   Emp --> BG
+  Decode --> BG
   BG -->|allow| Out
   BG -->|refuse| Block["Refuse + audit"]
 ```

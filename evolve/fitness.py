@@ -101,9 +101,16 @@ def evaluate_genome(
     )
     quality = quality * (0.95 + 0.05 * min(1.0, w))
 
+    # 三层安全门：red-team AND cognitive AND values（不合格基因组不可晋升）
+    from evolve.safety_fitness import gate_fitness, safety_score, cognitive_score, values_score
+    s = safety_score()
+    c = cognitive_score()
+    v = values_score()
+    gated = gate_fitness(quality, safety=s, cognitive=c, values=v)
+
     return Individual(
         genome=genome,
-        quality=quality,
+        quality=gated,
         active_flops=cost.active_flops_per_token,
         peak_vram_gb=cost.peak_vram_gb,
         latency_ms=latency_ms,
@@ -114,5 +121,9 @@ def evaluate_genome(
             "total_params_b": cost.total_params_b,
             "active_params_b": cost.active_params_b,
             "preset": genome.preset,
+            "raw_quality": quality,
+            "safety_score": s,
+            "cognitive_score": c,
+            "values_score": v,
         },
     )

@@ -1,4 +1,9 @@
-"""Luna-Ultimate Fused: hybrid CTM × Mamba2 × MLA × FlashMoE × JEPA."""
+"""Luna-Ultimate Fused: hybrid CTM × Mamba2 × MLA × FlashMoE × JEPA.
+
+支持 decode_mode:
+  - "meaning_first"（默认，Q1B）：MeaningPlanner → MeaningFirstDecoder，无 AR fallback
+  - "autoregressive"：仅训练稳定性对照，不作为推理回退路径（Q3B）
+"""
 
 from __future__ import annotations
 
@@ -13,14 +18,16 @@ from loss_manager import StageAwareLossManager
 from modeling_ctm import CTM
 from modeling_flashmoe import FlashMoE
 from modeling_mamba2 import Mamba2Block
+from modeling_meaning import CollapseDetector, MeaningFirstDecoder, MeaningPlanner
 from modeling_mla import MLABlock
+from modeling_thalamus import RoutePlan, ThalamusRouter
 from quant_utils import RMSNorm
 
 
 class LunaUltimateFused(nn.Module):
     """Fused Luna model with block-level CTM injection."""
 
-    def __init__(self, config: LunaConfig):
+    def __init__(self, config: LunaConfig, decode_mode: str = "meaning_first"):
         super().__init__()
         self.config = config
         self.d_model = config.hidden_size
@@ -30,6 +37,9 @@ class LunaUltimateFused(nn.Module):
         self.mla_layers = config.mla_layers
         self.ctm_inject_every = getattr(config, "ctm_inject_every", 4)
         self._grad_ckpt = False
+        if decode_mode not in ("meaning_first", "autoregressive"):
+            raise ValueError(f"unknown decode_mode={decode_mode!r}")
+        self.decode_mode = decode_mode
 
         self.embed_tokens = nn.Embedding(config.vocab_size, self.d_model)
 
@@ -67,6 +77,13 @@ class LunaUltimateFused(nn.Module):
         self.final_norm = RMSNorm(self.d_model, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(self.d_model, self.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
+
+        # WB-HCA: 丘脑路由 + 意义优先解码（Q1B，无 fallback）
+        self.thalamus = ThalamusRouter(config)
+        self.meaning_planner = MeaningPlanner(config)
+        self.meaning_decoder = MeaningFirstDecoder(config, lm_head=self.lm_head)
+        self.collapse_detector = CollapseDetector()
+        self.last_route_plan: Optional[RoutePlan] = None
 
         self.skip_probe_12 = nn.Linear(config.ctm_n_neurons, 1, bias=False)
         self.skip_probe_24 = nn.Linear(config.ctm_n_neurons, 1, bias=False)
@@ -132,6 +149,20 @@ class LunaUltimateFused(nn.Module):
         ctm_state = self.ctm.get_ctm_state(hidden_states)
         return ctm_output, ctm_state, ctmj_acc
 
+    def _apply_expert_budget(self, plan: Optional[RoutePlan]) -> List[int]:
+        """按丘脑预算临时缩放 MoE top_k；返回旧值以便恢复。"""
+        prev = [int(m.top_k) for m in self.moe_layers]
+        if plan is None:
+            return prev
+        k = self.thalamus.expert_top_k(self.config, plan)
+        for m in self.moe_layers:
+            m.top_k = k
+        return prev
+
+    def _restore_expert_budget(self, prev: List[int]) -> None:
+        for m, k in zip(self.moe_layers, prev):
+            m.top_k = k
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -142,124 +173,211 @@ class LunaUltimateFused(nn.Module):
         return_all_losses: bool = False,
         use_int4_cache: Optional[bool] = None,
         operator_embedding: Optional[torch.Tensor] = None,
+        route_text: Optional[str] = None,
+        decode_mode: Optional[str] = None,
+        labels: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         del attention_mask  # reserved
         B, L_txt = input_ids.shape
         device = input_ids.device
         outputs: Dict[str, torch.Tensor] = {}
+        mode = decode_mode or self.decode_mode
         if use_int4_cache is None:
             use_int4_cache = bool(self.config.use_kv_cache_int4) and not self.training
 
-        text_embeds = self.embed_tokens(input_ids)
-        if operator_embedding is not None:
-            op = operator_embedding.to(device=device, dtype=text_embeds.dtype)
-            if op.dim() == 2:
-                op = op.unsqueeze(1)
-            text_embeds = text_embeds + op
-        vjepa_features = None
-        vjepa_loss = torch.zeros((), device=device)
+        # 丘脑：按任务类型缩放专家预算（简单任务少唤醒）
+        plan: Optional[RoutePlan] = None
+        if route_text is not None:
+            plan = self.thalamus.plan_from_text(route_text)
+        self.last_route_plan = plan
+        prev_topk = self._apply_expert_budget(plan)
 
-        if visual_input is not None and self.vjepa is not None:
-            vjepa_features, vjepa_loss, _ = self.vjepa(visual_input)
+        try:
+            text_embeds = self.embed_tokens(input_ids)
+            if operator_embedding is not None:
+                op = operator_embedding.to(device=device, dtype=text_embeds.dtype)
+                if op.dim() == 2:
+                    op = op.unsqueeze(1)
+                text_embeds = text_embeds + op
+            vjepa_features = None
+            vjepa_loss = torch.zeros((), device=device)
 
-        if vjepa_features is not None:
-            hidden_states = torch.cat([vjepa_features, text_embeds], dim=1)
-        else:
-            hidden_states = text_embeds
+            if visual_input is not None and self.vjepa is not None:
+                vjepa_features, vjepa_loss, _ = self.vjepa(visual_input)
 
-        total_aux_loss = torch.zeros((), device=device)
-        total_ctmj_loss = torch.zeros((), device=device)
-        tick_list: List[int] = []
-        ctm_state = None
-        ctm_output = None
-        inject_every = max(1, self.ctm_inject_every)
-
-        # --- Mamba front ---
-        for layer_idx in range(self.mamba2_layers):
-            if ctm_output is None or (layer_idx % inject_every == 0):
-                ctm_output, ctm_state, total_ctmj_loss = self._refresh_ctm(
-                    hidden_states,
-                    use_ctm_adaptive,
-                    return_jepa=return_all_losses,
-                    tick_list=tick_list,
-                    ctmj_acc=total_ctmj_loss,
-                )
-
-            if use_dynamic_skip and ctm_state is not None:
-                skip_mask = self._should_skip_layers(ctm_state, layer_idx)
-                if bool(skip_mask.all()):
-                    continue
-
-            if self._grad_ckpt and self.training:
-                hidden_states, aux_loss, _ = torch.utils.checkpoint.checkpoint(
-                    self.mamba_blocks[layer_idx],
-                    hidden_states,
-                    self.moe_layers[layer_idx],
-                    ctm_output,
-                    use_reentrant=False,
-                )
-            else:
-                hidden_states, aux_loss, _ = self.mamba_blocks[layer_idx](
-                    hidden_states, self.moe_layers[layer_idx], ctm_output
-                )
-            total_aux_loss = total_aux_loss + aux_loss
-
-        # --- MLA back ---
-        for layer_idx in range(self.mla_layers):
-            global_idx = layer_idx + self.mamba2_layers
-            if ctm_output is None or (global_idx % inject_every == 0):
-                ctm_output, ctm_state, total_ctmj_loss = self._refresh_ctm(
-                    hidden_states,
-                    use_ctm_adaptive,
-                    return_jepa=return_all_losses,
-                    tick_list=tick_list,
-                    ctmj_acc=total_ctmj_loss,
-                )
-
-            if use_dynamic_skip and ctm_state is not None:
-                skip_mask = self._should_skip_layers(ctm_state, global_idx)
-                if bool(skip_mask.all()):
-                    continue
-
-            if self._grad_ckpt and self.training:
-                hidden_states, aux_loss, _ = torch.utils.checkpoint.checkpoint(
-                    self.mla_blocks[layer_idx],
-                    hidden_states,
-                    self.moe_layers[global_idx],
-                    ctm_output,
-                    None,
-                    use_int4_cache,
-                    use_reentrant=False,
-                )
-            else:
-                hidden_states, aux_loss, _ = self.mla_blocks[layer_idx](
-                    hidden_states,
-                    self.moe_layers[global_idx],
-                    ctm_output,
-                    kv_cache=None,
-                    use_int4_cache=use_int4_cache,
-                )
-            total_aux_loss = total_aux_loss + aux_loss
-
-        hidden_states = self.final_norm(hidden_states)
-        logits = self.lm_head(hidden_states)
-        outputs["logits"] = logits
-
-        avg_ticks = float(sum(tick_list) / max(1, len(tick_list)))
-        self.last_avg_ticks = avg_ticks
-        outputs["avg_ticks"] = torch.tensor(avg_ticks, device=device)
-
-        if return_all_losses:
             if vjepa_features is not None:
-                text_logits = logits[:, vjepa_features.shape[1] :, :]
+                hidden_states = torch.cat([vjepa_features, text_embeds], dim=1)
             else:
-                text_logits = logits
-            outputs["vjepa_loss"] = vjepa_loss
-            outputs["ctmj_loss"] = total_ctmj_loss
-            outputs["moe_loss"] = total_aux_loss
-            outputs["lm_logits"] = text_logits
+                hidden_states = text_embeds
+
+            total_aux_loss = torch.zeros((), device=device)
+            total_ctmj_loss = torch.zeros((), device=device)
+            tick_list: List[int] = []
+            ctm_state = None
+            ctm_output = None
+            inject_every = max(1, self.ctm_inject_every)
+
+            # --- Mamba front ---
+            for layer_idx in range(self.mamba2_layers):
+                if ctm_output is None or (layer_idx % inject_every == 0):
+                    ctm_output, ctm_state, total_ctmj_loss = self._refresh_ctm(
+                        hidden_states,
+                        use_ctm_adaptive,
+                        return_jepa=return_all_losses,
+                        tick_list=tick_list,
+                        ctmj_acc=total_ctmj_loss,
+                    )
+
+                if use_dynamic_skip and ctm_state is not None:
+                    skip_mask = self._should_skip_layers(ctm_state, layer_idx)
+                    if bool(skip_mask.all()):
+                        continue
+
+                if self._grad_ckpt and self.training:
+                    hidden_states, aux_loss, _ = torch.utils.checkpoint.checkpoint(
+                        self.mamba_blocks[layer_idx],
+                        hidden_states,
+                        self.moe_layers[layer_idx],
+                        ctm_output,
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden_states, aux_loss, _ = self.mamba_blocks[layer_idx](
+                        hidden_states, self.moe_layers[layer_idx], ctm_output
+                    )
+                total_aux_loss = total_aux_loss + aux_loss
+
+            # --- MLA back ---
+            for layer_idx in range(self.mla_layers):
+                global_idx = layer_idx + self.mamba2_layers
+                if ctm_output is None or (global_idx % inject_every == 0):
+                    ctm_output, ctm_state, total_ctmj_loss = self._refresh_ctm(
+                        hidden_states,
+                        use_ctm_adaptive,
+                        return_jepa=return_all_losses,
+                        tick_list=tick_list,
+                        ctmj_acc=total_ctmj_loss,
+                    )
+
+                if use_dynamic_skip and ctm_state is not None:
+                    skip_mask = self._should_skip_layers(ctm_state, global_idx)
+                    if bool(skip_mask.all()):
+                        continue
+
+                if self._grad_ckpt and self.training:
+                    hidden_states, aux_loss, _ = torch.utils.checkpoint.checkpoint(
+                        self.mla_blocks[layer_idx],
+                        hidden_states,
+                        self.moe_layers[global_idx],
+                        ctm_output,
+                        None,
+                        use_int4_cache,
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden_states, aux_loss, _ = self.mla_blocks[layer_idx](
+                        hidden_states,
+                        self.moe_layers[global_idx],
+                        ctm_output,
+                        kv_cache=None,
+                        use_int4_cache=use_int4_cache,
+                    )
+                total_aux_loss = total_aux_loss + aux_loss
+
+            hidden_states = self.final_norm(hidden_states)
+
+            # 默认 meaning_first：目标语义调制 logits（无 AR fallback）
+            target_meaning = None
+            recon_loss = torch.zeros((), device=device)
+            if mode == "meaning_first":
+                # 仅用文本段做意义规划（跳过视觉前缀）
+                if vjepa_features is not None:
+                    prompt_h = hidden_states[:, vjepa_features.shape[1] :, :]
+                else:
+                    prompt_h = hidden_states
+                target_meaning = self.meaning_planner.plan(prompt_h)
+                md_out = self.meaning_decoder(
+                    hidden_states,
+                    target_meaning,
+                    labels=labels,
+                    lm_head=self.lm_head,
+                )
+                logits = md_out["logits"]
+                if "recon_loss" in md_out:
+                    recon_loss = md_out["recon_loss"]
+                outputs["target_meaning"] = target_meaning
+                outputs["recon_loss"] = recon_loss
+            else:
+                logits = self.lm_head(hidden_states)
+
+            outputs["logits"] = logits
+            outputs["decode_mode"] = mode
+            if plan is not None:
+                outputs["expert_budget"] = torch.tensor(plan.expert_budget, device=device)
+                outputs["thalamus_task"] = plan.task_type.value
+
+            avg_ticks = float(sum(tick_list) / max(1, len(tick_list)))
+            self.last_avg_ticks = avg_ticks
+            outputs["avg_ticks"] = torch.tensor(avg_ticks, device=device)
+
+            if return_all_losses:
+                if vjepa_features is not None:
+                    text_logits = logits[:, vjepa_features.shape[1] :, :]
+                else:
+                    text_logits = logits
+                outputs["vjepa_loss"] = vjepa_loss
+                outputs["ctmj_loss"] = total_ctmj_loss
+                outputs["moe_loss"] = total_aux_loss
+                outputs["lm_logits"] = text_logits
+        finally:
+            self._restore_expert_budget(prev_topk)
 
         return outputs
+
+    @torch.no_grad()
+    def generate_meaning_first(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 32,
+        temperature: float = 1.0,
+        route_text: Optional[str] = None,
+        operator_embedding: Optional[torch.Tensor] = None,
+    ) -> Dict[str, object]:
+        """Q1B 推理：规划目标语义 → 纯意义解码；坍塌只标记不回退（Q3B）。"""
+        self.eval()
+        device = input_ids.device
+        # 先跑一遍主干拿 prompt hidden / meaning
+        out = self.forward(
+            input_ids,
+            route_text=route_text,
+            decode_mode="meaning_first",
+            operator_embedding=operator_embedding,
+            return_all_losses=False,
+        )
+        target_meaning = out["target_meaning"]
+
+        def _hidden_proj(emb: torch.Tensor) -> torch.Tensor:
+            # 轻量投影：用 final_norm 作为逐步 hidden 近似（tiny 冒烟路径）
+            return self.final_norm(emb)
+
+        gen_ids = self.meaning_decoder.generate(
+            hidden_proj=_hidden_proj,
+            embed=self.embed_tokens,
+            target_meaning=target_meaning,
+            max_len=max_new_tokens,
+            lm_head=self.lm_head,
+            bos_token_id=int(getattr(self.config, "pad_token_id", 0)),
+            temperature=temperature,
+        )
+        report = self.collapse_detector.check(gen_ids)
+        return {
+            "generated_ids": gen_ids,
+            "target_meaning": target_meaning,
+            "collapse": report,
+            "route": self.last_route_plan,
+            "decode_mode": "meaning_first",
+            "ar_fallback": False,
+        }
 
     def compute_loss(
         self,
@@ -282,6 +400,7 @@ class LunaUltimateFused(nn.Module):
             labels.reshape(B * L),
             ignore_index=-100,
         )
+        recon = outputs.get("recon_loss", torch.zeros((), device=lm_loss.device))
         losses = {
             "lm": lm_loss,
             "vjepa": outputs.get(
@@ -297,9 +416,14 @@ class LunaUltimateFused(nn.Module):
         total_loss, stats = self.loss_manager.compute_loss(
             losses, self, step, total_steps
         )
+        # 意义重建项（Q1B）：并入总 loss，不改变 StageAware 权重表
+        recon_lambda = 0.1
+        total_loss = total_loss + recon_lambda * recon
         stats["stage"] = float(self.training_stage)
         stats["lm_loss_raw"] = lm_loss.item()
+        stats["recon_loss"] = float(recon.detach().item()) if torch.is_tensor(recon) else float(recon)
         stats["avg_ticks"] = float(outputs.get("avg_ticks", torch.tensor(0.0)).item())
+        stats["decode_mode"] = str(outputs.get("decode_mode", self.decode_mode))
         return total_loss, stats
 
     def get_num_parameters(self) -> Tuple[float, float]:

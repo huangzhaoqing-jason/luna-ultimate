@@ -41,14 +41,15 @@ action_text + operator_token
   → CTMJEPAPredictor → predicted consequence
   → ForbiddenPrototypeSet cosine similarity          # "is the outcome forbidden?"
   → SafetyJudgment(allow/refuse, confidence, trace)
-  → final = charter_refuse OR ctm_refuse             # CTM can only add refusals
+  → values hard floor (VALUES_CHARTER)               # humanitarian / prosocial
+  → final = charter_refuse OR values_refuse OR ctm_refuse
   → AuditLog (with reasoning trace)
 ```
 
-**Invariant**: `final_refuse = charter_refuse OR ctm_refuse`. The CTM can
-refuse something the charter allowed (catching subtle harm the regex misses),
-but it can **never** allow something the charter refused. The charter is the
-hard floor; the CTM is the soft, learned layer on top.
+**Invariant**: `final_refuse = charter_refuse OR values_refuse OR ctm_refuse`.
+The CTM can refuse something the charter/values allowed (catching subtle harm
+the regex misses), but it can **never** allow something the charter or values
+refused. Charter + values are hard floors; the CTM is the soft layer on top.
 
 When untrained, `SafetyCTM` returns low confidence and abstains, so it does
 not randomly block legitimate operator goals. After training (future work),
