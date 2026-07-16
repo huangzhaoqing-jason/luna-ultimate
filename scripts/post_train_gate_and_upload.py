@@ -116,8 +116,10 @@ def gate_safety() -> Tuple[bool, str]:
 
 def package_for_upload(ckpt_path: Path, ckpt: Dict[str, Any], state: Dict[str, torch.Tensor], out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    # copy raw checkpoint
-    shutil.copy2(ckpt_path, out_dir / ckpt_path.name)
+    # copy raw checkpoint (skip if already inside out_dir)
+    dest_ckpt = out_dir / ckpt_path.name
+    if ckpt_path.resolve() != dest_ckpt.resolve():
+        shutil.copy2(ckpt_path, dest_ckpt)
     torch.save(state, out_dir / "pytorch_model.bin")
     cfg = ckpt.get("config") or {}
     if not cfg:
