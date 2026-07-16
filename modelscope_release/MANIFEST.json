@@ -1,0 +1,58 @@
+{
+  "model_id": "huang18928827157/luna-ultimate",
+  "source": "https://modelscope.cn/models/huang18928827157/luna-ultimate",
+  "github": "https://github.com/huangzhaoqing-jason/luna-ultimate",
+  "revision": "master",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "size": 2080,
+      "sha256": "e7627a90749c759d41ec6e1ac62e1ece1113072ed1b471428d7d63742d73b24f",
+      "is_lfs": false,
+      "revision": "7933dd3b0960da3e19d36a02887993fa686a81ff"
+    },
+    {
+      "path": "config.json",
+      "size": 2058,
+      "sha256": "84322e9afb8a3165e47404f1d7a4fc08a5d172b05465bc42120723512a517c42",
+      "is_lfs": false,
+      "revision": "055ef04539ff73657c66b497f4c9fb78c9a3dd21"
+    },
+    {
+      "path": "configuration.json",
+      "size": 2058,
+      "sha256": "84322e9afb8a3165e47404f1d7a4fc08a5d172b05465bc42120723512a517c42",
+      "is_lfs": false,
+      "revision": "055ef04539ff73657c66b497f4c9fb78c9a3dd21"
+    },
+    {
+      "path": "model-00001-of-00001.safetensors",
+      "size": 62596408,
+      "sha256": "ff7e3896e5beaeea42fe47d554c6dcffb1ea55f0509719e6884dafe53a0fb222",
+      "is_lfs": true,
+      "revision": "d38769a0e6e199cc3f57e1303cca92e5c0816a21"
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "size": 25927,
+      "sha256": "79b9d74ea10687ff0df28d2fb2b4e59f32b72cae41f6676bbb416b304994d498",
+      "is_lfs": false,
+      "revision": "055ef04539ff73657c66b497f4c9fb78c9a3dd21"
+    },
+    {
+      "path": "pytorch_model-00001-of-00001.bin",
+      "size": 54290466,
+      "sha256": "47500c829889e179a27cbcdfc77e64be98cf63eddcb710672337676ffca7feaf",
+      "is_lfs": true,
+      "revision": "7933dd3b0960da3e19d36a02887993fa686a81ff"
+    },
+    {
+      "path": "README.md",
+      "size": 386,
+      "sha256": "3dca57544d8b52063e18acc86d05545125bbe422d20b6592dc433d56d0712d5b",
+      "is_lfs": false,
+      "revision": "7933dd3b0960da3e19d36a02887993fa686a81ff"
+    }
+  ],
+  "preset": "tiny"
+}

@@ -2,7 +2,9 @@
 
 Usage:
     python train.py --preset tiny --smoke --batch_size 2 --seq_len 64 --max_steps 5
-    torchrun --nproc_per_node=8 train.py --preset 7b
+    python train.py --preset tiny --smoke --dataset AI-ModelScope/alpaca-gpt4-data-zh
+    python train.py --preset 550b --dataset AI-ModelScope/alpaca-gpt4-data-zh --allow_large
+    torchrun --nproc_per_node=8 train.py --preset 7b --dataset auto
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, DistributedSampler
 
 from config import LunaConfig
+from data.modelscope_dataset import DEFAULT_DATASET, build_dataset
 from modeling_luna_ultimate import LunaUltimateFused
 
 logging.basicConfig(
@@ -245,6 +248,12 @@ def train(args: argparse.Namespace):
     if args.learning_rate is not None:
         config.learning_rate = args.learning_rate
 
+    if config.preset_name == "550b" and not args.allow_large and not args.smoke:
+        raise SystemExit(
+            "Refusing 550b without --allow_large (needs multi-node GPUs). "
+            "Smoke with --preset tiny --dataset ..., or pass --allow_large."
+        )
+
     if args.smoke:
         args.seq_len = min(args.seq_len, 64)
         args.num_samples = min(args.num_samples, 32)
@@ -255,6 +264,7 @@ def train(args: argparse.Namespace):
         logger.info("=" * 60)
         logger.info("  Luna Evolve Training (LunaUltimateFused)")
         logger.info(f"  Preset: {config.preset_name} | GPUs: {world_size} | Device: {device}")
+        logger.info(f"  Dataset: {args.dataset or 'dummy'}")
         logger.info("=" * 60)
 
     model = LunaUltimateFused(config).to(device)
@@ -294,7 +304,15 @@ def train(args: argparse.Namespace):
     use_amp = args.use_amp and device.type == "cuda" and config.mixed_precision == "bf16"
     scaler = GradScaler(enabled=use_amp)
 
-    dataset = DummyDataset(config.vocab_size, args.seq_len, args.num_samples)
+    dataset = build_dataset(
+        args.dataset,
+        vocab_size=config.vocab_size,
+        seq_len=args.seq_len,
+        num_samples=args.num_samples,
+        dummy_cls=DummyDataset,
+    )
+    if is_main:
+        logger.info(f"Dataset size: {len(dataset)}")
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
         dataloader = DataLoader(
@@ -437,6 +455,11 @@ def main():
     parser = argparse.ArgumentParser(description="Luna Evolve Training")
     parser.add_argument("--preset", type=str, default="tiny")
     parser.add_argument("--smoke", action="store_true", help="Tiny smoke run")
+    parser.add_argument(
+        "--allow_large",
+        action="store_true",
+        help="Permit 550b init (multi-node / DeepSpeed required in practice)",
+    )
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=1)
@@ -446,6 +469,16 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help=(
+            "ModelScope dataset id (e.g. AI-ModelScope/alpaca-gpt4-data-zh), "
+            f"'auto' for curated defaults (default {DEFAULT_DATASET}), "
+            "or 'dummy' for random ids"
+        ),
+    )
     parser.add_argument("--use_amp", action="store_true", default=False)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
     parser.add_argument("--dynamic_layer_skip", action="store_true", default=False)
@@ -455,6 +488,9 @@ def main():
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     args = parser.parse_args()
+    # Default 550b runs pull ModelScope data unless user overrides.
+    if args.dataset is None and args.preset in {"550b", "77b_active"}:
+        args.dataset = DEFAULT_DATASET
     train(args)
 
 

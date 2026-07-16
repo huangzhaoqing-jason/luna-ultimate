@@ -3,6 +3,7 @@ __pycache__/
 *.pt
 *.pth
 *.bin
+*.safetensors
 checkpoints/
 evolve_runs/
 eval_proxy.json
@@ -11,3 +12,7 @@ wandb/
 *.egg-info/
 dist/
 build/
+modelscope_release/.cache/
+modelscope_release/*.safetensors
+modelscope_release/*.bin
+.cache/

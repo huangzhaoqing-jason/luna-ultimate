@@ -39,10 +39,44 @@ pip install -e .
 pip install -e ".[train]"
 ```
 
+## ModelScope ↔ GitHub sync
+
+Published weights: [huang18928827157/luna-ultimate](https://modelscope.cn/models/huang18928827157/luna-ultimate)  
+Synced metadata lives in [`modelscope_release/`](modelscope_release/) (config + index + MANIFEST).
+
+```bash
+# Pull latest ModelScope release metadata into this repo
+python scripts/sync_modelscope.py
+
+# Also download weight shards (gitignored; ~60MB tiny preset today)
+python scripts/sync_modelscope.py --download-weights
+# or
+python download_weights.py --repo huang18928827157/luna-ultimate
+```
+
+> Current ModelScope upload is the `tiny` champion smoke weights, **not** a full 550B checkpoint.
+
 ## Smoke train (tiny)
 
 ```bash
 python train.py --preset tiny --smoke --batch_size 2 --seq_len 64 --max_steps 5
+```
+
+### Train on ModelScope datasets
+
+Default public set from [modelscope.cn/datasets](https://modelscope.cn/datasets): `AI-ModelScope/alpaca-gpt4-data-zh`.
+
+```bash
+# tiny smoke on real ModelScope data
+python train.py --preset tiny --smoke \
+  --dataset AI-ModelScope/alpaca-gpt4-data-zh \
+  --batch_size 2 --seq_len 64 --max_steps 5
+
+# 550b ladder entry (needs multi-node GPUs + DeepSpeed; will not fit this laptop)
+python scripts/scale_train.py --preset 550b --allow-large \
+  --dataset AI-ModelScope/alpaca-gpt4-data-zh \
+  --deepspeed configs/ds_config_77b.json \
+  --max_steps 1000
 ```
 
 ## Self-evolution loop
@@ -55,13 +89,13 @@ python -m evolve.loop --preset tiny --generations 3 --population 4 --train_steps
 
 ```bash
 # 1b → 7b ladder helpers
-python scripts/scale_train.py --preset 1b --max_steps 100
+python scripts/scale_train.py --preset 1b --max_steps 100 --dataset auto
 python scripts/run_eval_proxy.py --preset tiny --checkpoint none
 ```
 
 ## 77B-active challenge
 
-See `configs/ds_config_77b.json` and `scripts/scale_train.py --preset 550b`  
+See `configs/ds_config_77b.json` and `scripts/scale_train.py --preset 550b --allow-large`  
 (only after evolve archive shows stable genomes on smaller ladders).
 
 ## License
