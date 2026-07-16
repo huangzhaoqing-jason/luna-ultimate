@@ -85,6 +85,8 @@ class LunaConfig:
     moe_capacity_factor: float = 1.25
     moe_aux_loss_coeff: float = 0.01
     moe_z_loss_coeff: float = 0.001
+    # 刀尖 = Top-K + shared 激活专家；550b 约 77–80B active / 550B total
+    # （FlashMoE 架构本身，不在此改写为流式存储）
 
     # ==================== RoPE / YaRN ====================
     rope_theta: float = 10000.0
@@ -284,7 +286,11 @@ _PRESETS: Dict[str, dict] = {
     },
     "550b": {
         "preset_name": "550b",
-        # defaults on LunaConfig already match 550B / ~77B active
+        # LunaConfig defaults = 550B total / ~77–80B FlashMoE-active (knife-tip)
+        "vjepa_enabled": False,
+        "vla_enabled": False,
+        "wa_enabled": False,
+        "motor_enabled": False,
     },
 }
 

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Scale-ladder training helper: tiny → 1b → 7b → (optional) 550b.
+"""Scale-ladder training helper: tiny → 1b → 7b → 550b (FlashMoE knife-tip).
+
+Goal: reach **550B total** with Apple-style FlashMoE so ~77–80B **active**
+params sit on the knife-tip (Top-K + shared). Do not rewrite FlashMoE —
+train the ladder, then run the 550b preset with the architecture as-is.
 
 Usage:
-  python scripts/scale_train.py --preset 1b --max_steps 100
+  python scripts/scale_train.py --preset 1b --max_steps 100 --data_path data/corpus.txt
   python scripts/scale_train.py --preset 7b --max_steps 500
   python scripts/scale_train.py --preset 550b --allow-large --deepspeed configs/ds_config_77b.json
 """
@@ -19,7 +23,7 @@ LADDER = ("tiny", "1b", "7b", "550b")
 
 
 def main():
-    p = argparse.ArgumentParser(description="Luna scale-ladder trainer")
+    p = argparse.ArgumentParser(description="Luna scale-ladder trainer → 550b knife-tip")
     p.add_argument("--preset", type=str, default="1b", choices=list(LADDER) + ["77b_active"])
     p.add_argument("--max_steps", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=1)
@@ -36,7 +40,13 @@ def main():
 
     preset = "550b" if args.preset == "77b_active" else args.preset
     if preset == "550b" and not args.allow_large:
-        print("Refusing 550b without --allow-large. Stabilize 1b/7b first.", file=sys.stderr)
+        print(
+            "Refusing 550b without --allow-large.\n"
+            "Policy: train tiny→1b→7b first; FlashMoE knife-tip (~77B active) "
+            "is the 550b challenge. Needs multi-GPU + ZeRO-3 "
+            "(configs/ds_config_77b.json).",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     cmd = [
@@ -62,6 +72,11 @@ def main():
         cmd.extend(["--use_deepspeed", "--deepspeed_config", args.deepspeed])
 
     print("Running:", " ".join(cmd))
+    if preset == "550b":
+        print(
+            "Note: 550b = ~550B total / ~77–80B FlashMoE-active (knife-tip). "
+            "Architecture unchanged; train then serve with Top-K activation."
+        )
     raise SystemExit(subprocess.call(cmd, cwd=str(ROOT)))
 
 

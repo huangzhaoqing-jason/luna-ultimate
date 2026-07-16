@@ -73,7 +73,7 @@ class LunaUltimateFused(nn.Module):
             for i in range(self.mla_layers)
         ])
         self.moe_layers = nn.ModuleList([
-            FlashMoE(config) for _ in range(self.num_layers)
+            FlashMoE(config, layer_idx=i) for i in range(self.num_layers)
         ])
 
         self.final_norm = RMSNorm(self.d_model, eps=config.rms_norm_eps)

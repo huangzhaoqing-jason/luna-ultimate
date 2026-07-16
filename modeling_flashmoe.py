@@ -1,4 +1,10 @@
-"""FlashMoE Layer for Luna Evolve — correct gather/scatter + z-loss."""
+"""FlashMoE Layer for Luna Evolve — Apple-style fine-grained MoE.
+
+Architecture (do not reinvent): Top-K routed experts + shared experts,
+load-balance aux loss + router z-loss, capacity factor. The 550B preset
+keeps ~77–80B **active** on the knife-tip (Top-K + shared) while total
+weights stay ~550B.
+"""
 
 from __future__ import annotations
 
@@ -27,9 +33,14 @@ class ExpertFFN(nn.Module):
 
 
 class FlashMoE(nn.Module):
-    """Fine-grained MoE with Top-K routing, shared experts, aux + z-loss."""
+    """Fine-grained MoE with Top-K routing, shared experts, aux + z-loss.
 
-    def __init__(self, config: LunaConfig):
+    Knife-tip: only ``top_k + num_shared`` experts fire per token — that is
+    where training signal and inference FLOPs concentrate for max quality
+    at a given active-parameter budget.
+    """
+
+    def __init__(self, config: LunaConfig, layer_idx: int = 0):
         super().__init__()
         self.d_model = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -39,6 +50,7 @@ class FlashMoE(nn.Module):
         self.capacity_factor = config.moe_capacity_factor
         self.aux_loss_coeff = config.moe_aux_loss_coeff
         self.z_loss_coeff = getattr(config, "moe_z_loss_coeff", 0.001)
+        self.layer_idx = layer_idx
 
         self.router = nn.Linear(self.d_model, self.num_routed, bias=False)
         self.routed_experts = nn.ModuleList([
@@ -137,10 +149,10 @@ class FlashMoE(nn.Module):
             seq_idx = token_indices[:, 1]
             topk_idx = token_indices[:, 2]
             flat_idx = batch_idx * L + seq_idx
-            tokens = flat_hidden[flat_idx]  # [N, D]
+            tokens = flat_hidden[flat_idx]
             weights = topk_weights[batch_idx, seq_idx, topk_idx]
 
-            expert_out = self.routed_experts[expert_idx](tokens)  # [N, D]
+            expert_out = self.routed_experts[expert_idx](tokens)
             flat_output.index_add_(0, flat_idx, expert_out * weights.unsqueeze(-1))
 
         output = flat_output.view(B, L, D)
@@ -152,12 +164,14 @@ class FlashMoE(nn.Module):
         return output, combined_aux
 
     def prefetch_cold_experts_to_cpu(self):
+        """Optional deploy helper — not part of the core FlashMoE math."""
         hot = set(self.get_hot_experts())
         for idx, expert in enumerate(self.routed_experts):
             if idx not in hot:
                 expert.cpu()
 
     def prefetch_hot_experts_to_gpu(self, device: torch.device):
+        """Optional deploy helper — not part of the core FlashMoE math."""
         hot = set(self.get_hot_experts())
         for idx, expert in enumerate(self.routed_experts):
             if idx in hot:
