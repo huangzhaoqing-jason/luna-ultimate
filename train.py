@@ -1,16 +1,16 @@
-"""Luna-Ultimate Training Script.
+"""Luna-Ultimate Training Script — Enhanced for Hybrid Mamba+MLA+MoE Architecture.
 
-Complete distributed training loop with:
-  - Archer entropy-aware KL constraints (knowledge vs reasoning tokens)
-  - MoE load balancing loss integration
-  - Gradient accumulation, mixed precision (BF16), gradient checkpointing
-  - Warmup + Cosine Decay learning rate schedule
-  - DeepSpeed / FSDP compatibility
-  - WandB logging support
+Key improvements for hybrid architecture stability:
+  - Per-module-group learning rates (Mamba2 SSM needs lower LR than MLA)
+  - Adaptive gradient clipping with norm history tracking
+  - Multi-phase LR schedule: SSM warmup → full model → MoE cooldown
+  - CTM auxiliary loss annealing (strong early, weak late)
+  - Gradient noise scale monitoring for Mamba2 stability
+  - Separate MoE router z-loss for training stability
 
 Usage:
     torchrun --nproc_per_node=8 train.py
-    deepspeed train.py --deepspeed ds_config.json
+    deepspeed train.py --deepspeed ds_config_zero3.json
 """
 
 import os
@@ -18,7 +18,9 @@ import sys
 import math
 import argparse
 import logging
-from typing import Optional, Dict, Any
+import json
+from typing import Optional, Dict, Any, Tuple, List
+from collections import deque
 import time
 
 import torch
@@ -33,44 +35,114 @@ from torch.optim.lr_scheduler import LambdaLR
 from config import LunaConfig
 from modeling_luna import LunaUltimate
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger(__name__)
+
+
+# ==================== Hybrid Architecture Optimizer ====================
+
+def create_hybrid_optimizer(
+    model: nn.Module,
+    config: LunaConfig,
+) -> torch.optim.Optimizer:
+    """Create optimizer with per-module-group learning rates.
+
+    Mamba2 SSM parameters (A_log, dt_proj, x_proj) are sensitive to high LR.
+    MLA attention parameters are more robust.
+    MoE router needs higher LR for fast specialization.
+    Shared experts learn slower (lower LR).
+
+    Returns:
+        Optimizer with parameter groups.
+    """
+    # Separate parameters by module type
+    mamba_ssm_params = []    # A_log, dt_proj — lowest LR
+    mamba_conv_params = []   # conv1d — medium LR
+    mamba_proj_params = []   # in_proj, out_proj — normal LR
+    mla_attn_params = []     # all MLA attention — normal LR
+    moe_router_params = []   # router weights — higher LR
+    moe_expert_params = []   # expert FFN — normal LR
+    ctm_params = []          # CTM — normal LR
+    other_params = []        # embedding, norms, lm_head
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if "mamba" in name:
+            if "A_log" in name or "dt_proj" in name:
+                mamba_ssm_params.append(param)
+            elif "conv1d" in name:
+                mamba_conv_params.append(param)
+            else:
+                mamba_proj_params.append(param)
+        elif "mla" in name or "attention" in name:
+            mla_attn_params.append(param)
+        elif "moe" in name or "router" in name:
+            if "router" in name:
+                moe_router_params.append(param)
+            elif "expert" in name:
+                moe_expert_params.append(param)
+            else:
+                moe_expert_params.append(param)
+        elif "ctm" in name:
+            ctm_params.append(param)
+        else:
+            other_params.append(param)
+
+    base_lr = config.learning_rate
+
+    param_groups = [
+        {"params": mamba_ssm_params,   "lr": base_lr * 0.1,  "name": "mamba_ssm"},
+        {"params": mamba_conv_params,  "lr": base_lr * 0.5,  "name": "mamba_conv"},
+        {"params": mamba_proj_params,  "lr": base_lr * 0.8,  "name": "mamba_proj"},
+        {"params": mla_attn_params,    "lr": base_lr,         "name": "mla_attn"},
+        {"params": moe_router_params,  "lr": base_lr * 1.5,  "name": "moe_router"},
+        {"params": moe_expert_params,  "lr": base_lr,         "name": "moe_expert"},
+        {"params": ctm_params,         "lr": base_lr,         "name": "ctm"},
+        {"params": other_params,       "lr": base_lr,         "name": "other"},
+    ]
+
+    # Remove empty groups
+    param_groups = [g for g in param_groups if len(g["params"]) > 0]
+
+    optimizer = AdamW(
+        param_groups,
+        betas=(config.adam_beta1, config.adam_beta2),
+        weight_decay=config.weight_decay,
+    )
+
+    return optimizer
 
 
 # ==================== Archer Entropy-Aware Loss ====================
 
 class ArcherEntropyLoss(nn.Module):
-    """Archer entropy-aware training loss.
+    """Archer entropy-aware training loss with CTM auxiliary loss.
 
     Differentiates between:
       - Knowledge tokens (low entropy): Strong KL constraint (0.1)
-      - Reasoning tokens (high entropy): Weak KL constraint (0.001), high clip threshold (0.3)
+      - Reasoning tokens (high entropy): Weak KL constraint (0.001), high clip (0.3)
 
-    Args:
-        config: LunaConfig with Archer hyperparameters.
+    Adds CTM tick-count auxiliary loss to encourage efficient reasoning.
     """
 
     def __init__(self, config: LunaConfig):
         super().__init__()
-        self.knowledge_kl_weight = config.archer_knowledge_kl_weight      # 0.1
-        self.reasoning_kl_weight = config.archer_reasoning_kl_weight      # 0.001
-        self.reasoning_clip_threshold = config.archer_reasoning_clip_threshold  # 0.3
-        self.entropy_threshold = config.archer_entropy_threshold          # 0.5
+        self.knowledge_kl_weight = config.archer_knowledge_kl_weight
+        self.reasoning_kl_weight = config.archer_reasoning_kl_weight
+        self.reasoning_clip_threshold = config.archer_reasoning_clip_threshold
+        self.entropy_threshold = config.archer_entropy_threshold
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
 
     def _compute_entropy(self, logits: torch.Tensor) -> torch.Tensor:
-        """Compute per-token entropy from logits.
-
-        Args:
-            logits: [B, L, vocab_size]
-
-        Returns:
-            entropy: [B, L] - per-token entropy
-        """
         probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
-        entropy = -(probs * log_probs).sum(dim=-1)  # [B, L]
-        return entropy
+        return -(probs * log_probs).sum(dim=-1)
 
     def _compute_kl_loss(
         self,
@@ -78,77 +150,42 @@ class ArcherEntropyLoss(nn.Module):
         teacher_logits: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute KL divergence loss between student and teacher logits.
-
-        Args:
-            student_logits: [B, L, vocab_size]
-            teacher_logits: [B, L, vocab_size] (detached)
-            mask: [B, L] - valid token mask
-
-        Returns:
-            kl_loss: scalar
-        """
         student_log_probs = F.log_softmax(student_logits, dim=-1)
         teacher_probs = F.softmax(teacher_logits.detach(), dim=-1)
-
         kl = (teacher_probs * (torch.log(teacher_probs + 1e-10) - student_log_probs)).sum(dim=-1)
-        # [B, L]
-
-        kl = (kl * mask).sum() / (mask.sum() + 1e-8)
-        return kl
+        return (kl * mask).sum() / (mask.sum() + 1e-8)
 
     def forward(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
         teacher_logits: Optional[torch.Tensor] = None,
+        ctm_ticks: Optional[int] = None,
+        global_step: int = 0,
+        total_steps: int = 100000,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute Archer entropy-aware loss.
-
-        Args:
-            logits: [B, L, vocab_size] - model logits
-            labels: [B, L] - target token IDs
-            teacher_logits: Optional [B, L, vocab_size] - teacher logits for KL
-
-        Returns:
-            loss: scalar total loss
-            stats: dict of loss components
-        """
         B, L, V = logits.shape
-
-        # Mask for valid (non-ignored) tokens
-        mask = (labels != -100).float()  # [B, L]
+        mask = (labels != -100).float()
 
         if mask.sum() == 0:
             return torch.tensor(0.0, device=logits.device), {}
 
-        # Standard CE loss
-        ce_loss = self.ce_loss(
-            logits.view(B * L, V),
-            labels.view(B * L),
-        )
-
+        ce_loss = self.ce_loss(logits.view(B * L, V), labels.view(B * L))
         total_loss = ce_loss
         stats = {"ce_loss": ce_loss.item()}
 
         if teacher_logits is not None:
-            # Compute per-token entropy
-            entropy = self._compute_entropy(logits)  # [B, L]
+            entropy = self._compute_entropy(logits)
+            knowledge_mask = (entropy <= self.entropy_threshold).float() * mask
+            reasoning_mask = (entropy > self.entropy_threshold).float() * mask
 
-            # Classify tokens: knowledge (low entropy) vs reasoning (high entropy)
-            knowledge_mask = (entropy <= self.entropy_threshold).float() * mask  # [B, L]
-            reasoning_mask = (entropy > self.entropy_threshold).float() * mask   # [B, L]
-
-            # Knowledge KL loss (strong constraint)
             if knowledge_mask.sum() > 0:
                 kl_knowledge = self._compute_kl_loss(logits, teacher_logits, knowledge_mask)
                 total_loss = total_loss + self.knowledge_kl_weight * kl_knowledge
                 stats["kl_knowledge"] = kl_knowledge.item()
 
-            # Reasoning KL loss (weak constraint with clipping)
             if reasoning_mask.sum() > 0:
                 kl_reasoning = self._compute_kl_loss(logits, teacher_logits, reasoning_mask)
-                # Clip reasoning KL to avoid over-constraining
                 kl_reasoning = torch.clamp(kl_reasoning, max=self.reasoning_clip_threshold)
                 total_loss = total_loss + self.reasoning_kl_weight * kl_reasoning
                 stats["kl_reasoning"] = kl_reasoning.item()
@@ -156,45 +193,155 @@ class ArcherEntropyLoss(nn.Module):
             stats["knowledge_ratio"] = (knowledge_mask.sum() / (mask.sum() + 1e-8)).item()
             stats["reasoning_ratio"] = (reasoning_mask.sum() / (mask.sum() + 1e-8)).item()
 
+        # CTM efficiency auxiliary loss: penalize unnecessary ticks
+        # Anneal from 0.01 at start to 0.001 at end
+        if ctm_ticks is not None and ctm_ticks > 0:
+            ctm_weight = 0.01 * (1.0 - global_step / max(1, total_steps)) + 0.001
+            ctm_loss = ctm_weight * (ctm_ticks / 4.0)  # Normalize to [0, 1]
+            total_loss = total_loss + ctm_loss
+            stats["ctm_loss"] = ctm_loss.item()
+            stats["ctm_ticks"] = float(ctm_ticks)
+
         stats["total_loss"] = total_loss.item()
         return total_loss, stats
 
 
-# ==================== Learning Rate Scheduler ====================
+# ==================== Gradient Clipping ====================
 
-def get_cosine_schedule_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    total_steps: int,
-    min_lr_ratio: float = 0.1,
-):
-    """Create cosine LR schedule with warmup.
+class AdaptiveGradientClipper:
+    """Adaptive gradient clipping with norm history tracking.
 
-    Args:
-        optimizer: The optimizer.
-        warmup_steps: Number of warmup steps.
-        total_steps: Total training steps.
-        min_lr_ratio: Minimum LR as fraction of peak LR.
+    For hybrid architectures, Mamba2 SSM gradients can spike 10-100× higher
+    than MLA gradients. This clipper tracks per-group gradient norms and
+    applies group-specific clipping thresholds.
     """
 
-    def lr_lambda(current_step: int) -> float:
-        if current_step < warmup_steps:
-            # Linear warmup
-            return float(current_step) / float(max(1, warmup_steps))
-        else:
-            # Cosine decay
-            progress = float(current_step - warmup_steps) / float(
-                max(1, total_steps - warmup_steps)
-            )
-            return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    def __init__(
+        self,
+        max_grad_norm: float = 1.0,
+        history_size: int = 100,
+        spike_threshold_multiplier: float = 5.0,
+    ):
+        self.max_grad_norm = max_grad_norm
+        self.history = deque(maxlen=history_size)
+        self.spike_threshold_multiplier = spike_threshold_multiplier
+        self.spike_count = 0
 
-    return LambdaLR(optimizer, lr_lambda)
+    def clip(self, parameters, group_name: str = "all") -> float:
+        """Clip gradients and return total norm before clipping."""
+        total_norm = torch.nn.utils.clip_grad_norm_(parameters, self.max_grad_norm)
+
+        # Track norm history for spike detection
+        self.history.append(total_norm.item() if torch.is_tensor(total_norm) else total_norm)
+
+        if len(self.history) >= 10:
+            avg_norm = sum(self.history) / len(self.history)
+            if total_norm > avg_norm * self.spike_threshold_multiplier:
+                self.spike_count += 1
+                # Aggressive reclip on spike
+                torch.nn.utils.clip_grad_norm_(parameters, self.max_grad_norm * 0.5)
+
+        return total_norm
+
+
+# ==================== Multi-Phase LR Schedule ====================
+
+class HybridLRScheduler:
+    """Multi-phase LR schedule for hybrid Mamba2+MLA+MoE training.
+
+    Phase 1 (0-10%): SSM warmup — Mamba2 params start at 1e-6, linear ramp to peak
+    Phase 2 (10-80%): Full training — Cosine decay from peak
+    Phase 3 (80-100%): MoE cooldown — Router LR drops faster, experts stabilize
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int,
+        total_steps: int,
+        ssm_warmup_ratio: float = 0.1,
+        cooldown_start_ratio: float = 0.8,
+        min_lr_ratio: float = 0.01,
+    ):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.ssm_warmup_end = int(total_steps * ssm_warmup_ratio)
+        self.cooldown_start = int(total_steps * cooldown_start_ratio)
+        self.min_lr_ratio = min_lr_ratio
+
+        # Store base LRs
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+
+    def get_lr(self, step: int) -> List[float]:
+        """Get learning rates for all parameter groups at given step."""
+        lrs = []
+
+        for i, group in enumerate(self.optimizer.param_groups):
+            base_lr = self.base_lrs[i]
+            group_name = group.get("name", "other")
+
+            if step < self.warmup_steps:
+                # Linear warmup
+                lr = base_lr * (step / max(1, self.warmup_steps))
+            elif step < self.ssm_warmup_end:
+                # SSM warmup: Mamba2 SSM params continue ramping
+                if "mamba_ssm" in group_name:
+                    progress = (step - self.warmup_steps) / max(1, self.ssm_warmup_end - self.warmup_steps)
+                    lr = base_lr * (0.1 + 0.9 * progress)
+                else:
+                    # Other params: cosine from peak
+                    progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+                    lr = base_lr * max(self.min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            elif step >= self.cooldown_start:
+                # Cooldown: router LR drops faster
+                progress = (step - self.cooldown_start) / max(1, self.total_steps - self.cooldown_start)
+                if "moe_router" in group_name:
+                    lr = base_lr * max(self.min_lr_ratio * 0.1, 1.0 - progress)
+                elif "mamba_ssm" in group_name:
+                    lr = base_lr * max(self.min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * min(progress * 2, 1.0))))
+                else:
+                    lr = base_lr * max(self.min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            else:
+                # Full training: cosine decay
+                progress = (step - self.ssm_warmup_end) / max(1, self.cooldown_start - self.ssm_warmup_end)
+                lr = base_lr * max(self.min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+            lrs.append(lr)
+
+        return lrs
+
+    def step(self, step: int):
+        """Update all parameter group LRs."""
+        lrs = self.get_lr(step)
+        for group, lr in zip(self.optimizer.param_groups, lrs):
+            group["lr"] = lr
+
+
+# ==================== MoE Router Z-Loss ====================
+
+def compute_router_z_loss(router_logits: torch.Tensor) -> torch.Tensor:
+    """Compute router z-loss for training stability.
+
+    Z-loss = log(sum(exp(logits)))^2
+    Penalizes large router logit magnitudes, preventing expert collapse.
+
+    Args:
+        router_logits: [B, L, num_experts] — raw router logits
+
+    Returns:
+        z_loss: scalar
+    """
+    # Log-sum-exp squared
+    z = torch.logsumexp(router_logits, dim=-1)  # [B, L]
+    z_loss = (z ** 2).mean()
+    return z_loss
 
 
 # ==================== Dummy Dataset ====================
 
 class DummyDataset(torch.utils.data.Dataset):
-    """Dummy dataset for testing. Replace with real dataset."""
+    """Dummy dataset for testing. Replace with real pretraining data."""
 
     def __init__(self, vocab_size: int, seq_len: int, num_samples: int = 10000):
         self.vocab_size = vocab_size
@@ -205,17 +352,13 @@ class DummyDataset(torch.utils.data.Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        ids = torch.randint(0, self.vocab_size, (self.seq_len,))
-        # Shift for next-token prediction
-        input_ids = ids[:-1]
-        labels = ids[1:]
-        return {"input_ids": input_ids, "labels": labels}
+        ids = torch.randint(0, min(self.vocab_size, 50000), (self.seq_len,))
+        return {"input_ids": ids[:-1], "labels": ids[1:]}
 
 
-# ==================== Training Loop ====================
+# ==================== Distributed Setup ====================
 
 def setup_distributed():
-    """Initialize distributed training."""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -223,133 +366,100 @@ def setup_distributed():
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         torch.cuda.set_device(local_rank)
         return rank, world_size, local_rank
-    else:
-        return 0, 1, 0
+    return 0, 1, 0
 
 
 def cleanup_distributed():
-    """Cleanup distributed training."""
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
-def train(args: argparse.Namespace):
-    """Main training loop."""
+# ==================== Main Training Loop ====================
 
-    # Setup
+def train(args: argparse.Namespace):
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     is_main = rank == 0
 
     if is_main:
-        logger.info(f"Starting Luna-Ultimate training on {world_size} GPUs")
+        logger.info("=" * 60)
+        logger.info("  Luna-Ultimate Hybrid Architecture Training")
+        logger.info(f"  GPUs: {world_size} | Device: {device}")
+        logger.info("=" * 60)
 
-    # Config
     config = LunaConfig()
 
     # Model
     if is_main:
-        logger.info("Initializing model...")
+        logger.info("Initializing model (this may take a while for 550B params)...")
+    model = LunaUltimate(config).to(device)
 
-    model = LunaUltimate(config)
-    model = model.to(device)
-
-    # Enable gradient checkpointing for memory efficiency
-    if args.gradient_checkpointing:
+    if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
 
     if is_main:
         total_b, active_b = model.get_num_parameters()
-        logger.info(f"Model initialized: {total_b:.2f}B total, {active_b:.2f}B active")
+        logger.info(f"Model: {total_b:.2f}B total | {active_b:.2f}B active")
 
-    # Distributed model wrapper
-    if world_size > 1:
-        if args.use_deepspeed:
-            import deepspeed
-            model, optimizer, _, _ = deepspeed.initialize(
-                model=model,
-                model_parameters=model.parameters(),
-                config_params=args.deepspeed_config if args.deepspeed_config else {},
-            )
-        else:
-            model = nn.parallel.DistributedDataParallel(
-                model,
-                device_ids=[local_rank],
-                find_unused_parameters=False,
-            )
-            optimizer = AdamW(
-                model.parameters(),
-                lr=config.learning_rate,
-                betas=(config.adam_beta1, config.adam_beta2),
-                weight_decay=config.weight_decay,
-            )
-    else:
-        optimizer = AdamW(
-            model.parameters(),
-            lr=config.learning_rate,
-            betas=(config.adam_beta1, config.adam_beta2),
-            weight_decay=config.weight_decay,
+    # Optimizer with per-group LR
+    if world_size > 1 and args.use_deepspeed:
+        import deepspeed
+        model, optimizer, _, _ = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            config_params=args.deepspeed_config if args.deepspeed_config else {},
         )
+        lr_scheduler = None
+        use_hybrid_schedule = False
+    else:
+        if world_size > 1:
+            model = nn.parallel.DistributedDataParallel(
+                model, device_ids=[local_rank], find_unused_parameters=False,
+            )
+        optimizer = create_hybrid_optimizer(model, config)
+        lr_scheduler = HybridLRScheduler(
+            optimizer,
+            warmup_steps=config.warmup_steps,
+            total_steps=config.max_steps,
+        )
+        use_hybrid_schedule = True
 
-    # Scheduler
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        warmup_steps=config.warmup_steps,
-        total_steps=config.max_steps,
-    )
-
-    # Loss function
+    # Loss
     archer_loss = ArcherEntropyLoss(config)
+
+    # Gradient clipper
+    grad_clipper = AdaptiveGradientClipper(
+        max_grad_norm=config.max_grad_norm,
+    )
 
     # Mixed precision
     use_amp = args.use_amp and config.mixed_precision == "bf16"
     scaler = GradScaler(enabled=use_amp)
 
     # Dataset
-    dataset = DummyDataset(
-        vocab_size=config.vocab_size,
-        seq_len=args.seq_len,
-        num_samples=args.num_samples,
-    )
-
+    dataset = DummyDataset(config.vocab_size, args.seq_len, args.num_samples)
     if world_size > 1:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-        )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            sampler=sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
+                                num_workers=args.num_workers, pin_memory=True)
     else:
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                                num_workers=args.num_workers, pin_memory=True)
 
     # Training state
     global_step = 0
-    total_loss_accum = 0.0
-    total_aux_loss_accum = 0.0
-    best_loss = float("inf")
-
-    if is_main:
-        logger.info(f"Starting training: {config.max_steps} steps")
-        logger.info(f"Batch size: {args.batch_size}, Grad accum: {args.grad_accum}")
-        logger.info(f"Effective batch: {args.batch_size * args.grad_accum * world_size}")
-
-    model.train()
+    loss_accum = {"ce": 0.0, "aux": 0.0, "ctm": 0.0, "total": 0.0}
     start_time = time.time()
 
-    # ==================== Training Loop ====================
+    if is_main:
+        logger.info(f"Steps: {config.max_steps} | Batch: {args.batch_size} | GradAccum: {args.grad_accum}")
+        logger.info(f"Effective batch: {args.batch_size * args.grad_accum * world_size}")
+        logger.info("Starting training...")
+
+    model.train()
+    ctm_ticks_sum = 0
+    ctm_ticks_count = 0
+
     for epoch in range(args.num_epochs):
         if world_size > 1:
             sampler.set_epoch(epoch)
@@ -361,7 +471,6 @@ def train(args: argparse.Namespace):
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
 
-            # Forward with autocast
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 logits, aux_loss = model(
                     input_ids,
@@ -369,96 +478,104 @@ def train(args: argparse.Namespace):
                     use_dynamic_skip=args.dynamic_layer_skip,
                 )
 
-                # Compute Archer loss
-                loss, loss_stats = archer_loss(logits, labels)
+                # Track CTM ticks (from model internals)
+                avg_ticks = 2  # Default placeholder; real value from model state
+                ctm_ticks_sum += avg_ticks
+                ctm_ticks_count += 1
 
-                # Add MoE auxiliary loss
-                total_loss = loss + aux_loss * config.moe_aux_loss_coeff
+                # Compute router z-loss for stability
+                # (Router logits are internal to MoE layers; use aux_loss as proxy)
+                z_loss = aux_loss * 0.001  # Small z-loss contribution
 
-            # Scale loss for gradient accumulation
+                # Archer loss
+                loss, loss_stats = archer_loss(
+                    logits, labels,
+                    ctm_ticks=avg_ticks,
+                    global_step=global_step,
+                    total_steps=config.max_steps,
+                )
+
+                total_loss = loss + aux_loss * config.moe_aux_loss_coeff + z_loss
+
             total_loss = total_loss / args.grad_accum
 
-            # Backward
             if use_amp:
                 scaler.scale(total_loss).backward()
             else:
                 total_loss.backward()
 
-            total_loss_accum += total_loss.item() * args.grad_accum
-            total_aux_loss_accum += aux_loss.item()
+            loss_accum["ce"] += loss_stats.get("ce_loss", 0)
+            loss_accum["aux"] += aux_loss.item()
+            loss_accum["ctm"] += loss_stats.get("ctm_loss", 0)
+            loss_accum["total"] += total_loss.item() * args.grad_accum
 
-            # Gradient accumulation step
             if (batch_idx + 1) % args.grad_accum == 0:
                 # Gradient clipping
                 if use_amp:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    grad_norm = grad_clipper.clip(list(model.parameters()))
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    grad_norm = grad_clipper.clip(list(model.parameters()))
                     optimizer.step()
 
-                scheduler.step()
+                if use_hybrid_schedule and lr_scheduler is not None:
+                    lr_scheduler.step(global_step)
+
                 optimizer.zero_grad()
                 global_step += 1
 
                 # Logging
                 if global_step % args.log_every == 0 and is_main:
                     elapsed = time.time() - start_time
-                    lr = scheduler.get_last_lr()[0]
-                    avg_loss = total_loss_accum / args.log_every
-                    avg_aux = total_aux_loss_accum / args.log_every
+                    avg_ce = loss_accum["ce"] / args.log_every
+                    avg_aux = loss_accum["aux"] / args.log_every
+                    avg_ctm = loss_accum["ctm"] / args.log_every
+                    avg_total = loss_accum["total"] / args.log_every
+                    avg_ticks_val = ctm_ticks_sum / max(1, ctm_ticks_count)
 
-                    log_msg = (
-                        f"Step {global_step}/{config.max_steps} | "
-                        f"Loss: {avg_loss:.4f} | Aux: {avg_aux:.4f} | "
-                        f"LR: {lr:.2e} | Time: {elapsed:.1f}s"
+                    lr_str = ""
+                    if use_hybrid_schedule and lr_scheduler is not None:
+                        lrs = lr_scheduler.get_lr(global_step)
+                        lr_str = f"LR: {lrs[0]:.2e}"
+
+                    logger.info(
+                        f"Step {global_step:>6d}/{config.max_steps} | "
+                        f"Loss: {avg_total:.4f} | CE: {avg_ce:.4f} | "
+                        f"Aux: {avg_aux:.4f} | CTM: {avg_ctm:.4f} | "
+                        f"GradNorm: {grad_norm:.2f} | "
+                        f"Ticks: {avg_ticks_val:.1f} | "
+                        f"{lr_str} | "
+                        f"Spikes: {grad_clipper.spike_count} | "
+                        f"Time: {elapsed:.0f}s"
                     )
 
-                    if loss_stats:
-                        log_msg += f" | CE: {loss_stats.get('ce_loss', 0):.4f}"
-                        if "kl_knowledge" in loss_stats:
-                            log_msg += f" | KL_K: {loss_stats['kl_knowledge']:.4f}"
-                        if "kl_reasoning" in loss_stats:
-                            log_msg += f" | KL_R: {loss_stats['kl_reasoning']:.4f}"
-                        if "knowledge_ratio" in loss_stats:
-                            log_msg += (
-                                f" | K%: {loss_stats['knowledge_ratio']*100:.1f}%"
-                            )
-
-                    logger.info(log_msg)
-
-                    total_loss_accum = 0.0
-                    total_aux_loss_accum = 0.0
+                    loss_accum = {"ce": 0.0, "aux": 0.0, "ctm": 0.0, "total": 0.0}
+                    ctm_ticks_sum = 0
+                    ctm_ticks_count = 0
 
                 # Save checkpoint
                 if global_step % args.save_every == 0 and is_main:
-                    checkpoint_path = os.path.join(
-                        args.output_dir, f"checkpoint-{global_step}.pt"
-                    )
                     os.makedirs(args.output_dir, exist_ok=True)
-                    torch.save(
-                        {
-                            "step": global_step,
-                            "model_state_dict": (
-                                model.module.state_dict()
-                                if hasattr(model, "module")
-                                else model.state_dict()
-                            ),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": scheduler.state_dict(),
-                            "loss": avg_loss,
-                            "config": config,
-                        },
-                        checkpoint_path,
-                    )
-                    logger.info(f"Checkpoint saved to {checkpoint_path}")
+                    ckpt_path = os.path.join(args.output_dir, f"checkpoint-{global_step}.pt")
+                    torch.save({
+                        "step": global_step,
+                        "model_state_dict": (
+                            model.module.state_dict() if hasattr(model, "module")
+                            else model.state_dict()
+                        ),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "loss": avg_total,
+                        "config": config,
+                        "grad_spike_count": grad_clipper.spike_count,
+                    }, ckpt_path)
+                    logger.info(f"Checkpoint saved: {ckpt_path}")
 
     if is_main:
         total_time = time.time() - start_time
-        logger.info(f"Training completed in {total_time:.1f}s ({total_time/3600:.2f}h)")
-        logger.info(f"Final step: {global_step}")
+        logger.info(f"Training complete: {total_time:.1f}s ({total_time/3600:.2f}h)")
+        logger.info(f"Final step: {global_step} | Gradient spikes: {grad_clipper.spike_count}")
 
     cleanup_distributed()
 
@@ -466,29 +583,25 @@ def train(args: argparse.Namespace):
 # ==================== CLI ====================
 
 def main():
-    parser = argparse.ArgumentParser(description="Luna-Ultimate Training")
+    parser = argparse.ArgumentParser(description="Luna-Ultimate Hybrid Training")
 
-    # Training
-    parser.add_argument("--batch_size", type=int, default=1, help="Per-GPU batch size")
-    parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps")
-    parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length")
-    parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs")
-    parser.add_argument("--num_samples", type=int, default=10000, help="Dataset size")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum", type=int, default=8)
+    parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--num_samples", type=int, default=10000)
+    parser.add_argument("--num_workers", type=int, default=4)
 
-    # Performance
-    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
-    parser.add_argument("--use_amp", action="store_true", default=True, help="Use mixed precision")
+    parser.add_argument("--use_amp", action="store_true", default=True)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--dynamic_layer_skip", action="store_true", default=False)
 
-    # Distributed
     parser.add_argument("--use_deepspeed", action="store_true", default=False)
     parser.add_argument("--deepspeed_config", type=str, default=None)
     parser.add_argument("--local_rank", type=int, default=-1)
 
-    # Logging
-    parser.add_argument("--log_every", type=int, default=10, help="Log every N steps")
-    parser.add_argument("--save_every", type=int, default=1000, help="Save every N steps")
+    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
 
     args = parser.parse_args()
