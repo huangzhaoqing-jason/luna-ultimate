@@ -132,7 +132,7 @@ setup(
     author="huangzhaoqing-jason",
     author_email="luna-ultimate@github.com",
     url="https://github.com/huangzhaoqing-jason/luna-ultimate",
-    packages=find_packages() + ["evolve"],
+    packages=find_packages() + ["evolve", "safety", "code_evolve"],
     py_modules=[
         "config",
         "cost_model",
@@ -167,6 +167,9 @@ setup(
         "console_scripts": [
             "luna-train=train:main",
             "luna-evolve=evolve.loop:main",
+            "luna-code-evolve=code_evolve.loop:main",
+            "luna-safety-tests=scripts.run_safety_tests:main",
+            "luna-enroll-operator=scripts.enroll_operator:main",
             "luna-runtime=runtime_manager:main",
         ],
     },
