@@ -17,6 +17,17 @@ from evolve.fitness import evaluate_genome
 from evolve.genome import Genome, crossover, mutate, seed_population
 
 
+def _genome_intent_text(genome: Genome) -> str:
+    """One-line description of a genome's direction for SafetyCTM think-before-mutate."""
+    a = genome.arch
+    return (
+        f"evolve preset={genome.preset} mamba_ratio={a.mamba_ratio:.2f} "
+        f"experts={a.num_routed_experts} top_k={a.top_k} "
+        f"ctm_ticks={a.ctm_max_ticks} inject_every={a.ctm_inject_every} "
+        f"kv_lora={a.kv_lora_rank} intermediate={a.intermediate_size}"
+    )
+
+
 def run_evolution(args: argparse.Namespace) -> ParetoArchive:
     if args.preset in ("550b", "77b_active") and not args.allow_large:
         raise SystemExit(
@@ -27,6 +38,14 @@ def run_evolution(args: argparse.Namespace) -> ParetoArchive:
     archive = ParetoArchive(max_size=args.archive_size)
     population: List[Genome] = seed_population(args.preset, args.population, rng)
 
+    # CTM cognitive judge for think-before-mutate. The charter hard floor
+    # already applies via the fitness safety gate; this is an additional soft
+    # filter that skips genomes whose direction the CTM judges unsafe.
+    safety_ctm = None
+    if not getattr(args, "no_ctm", False):
+        from safety.cognition import default_safety_ctm
+        safety_ctm = default_safety_ctm()
+
     os.makedirs(args.output_dir, exist_ok=True)
 
     for gen in range(args.generations):
@@ -34,6 +53,14 @@ def run_evolution(args: argparse.Namespace) -> ParetoArchive:
         evaluated = []
         for g in population:
             g.generation = gen
+            # Think-before-mutate: CTM judges the genome's intent; refused
+            # genomes are skipped and never sent to short-training.
+            if safety_ctm is not None:
+                j = safety_ctm.judge(_genome_intent_text(g))
+                if not j.allow:
+                    print(f"  {g.genome_id}: ctm_refused "
+                          f"(sim={j.max_forbidden_sim:.3f} conf={j.confidence:.3f}) — skipped")
+                    continue
             ind = evaluate_genome(
                 g,
                 train_steps=args.train_steps,
@@ -106,6 +133,11 @@ def main():
         "--allow-large",
         action="store_true",
         help="Allow 550b/77b_active materialization (expensive)",
+    )
+    p.add_argument(
+        "--no-ctm",
+        action="store_true",
+        help="Disable the CTM think-before-mutate judge (safety gate still applies)",
     )
     args = p.parse_args()
     run_evolution(args)

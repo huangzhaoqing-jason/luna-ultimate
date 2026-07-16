@@ -141,6 +141,7 @@ class LunaUltimateFused(nn.Module):
         use_dynamic_skip: bool = False,
         return_all_losses: bool = False,
         use_int4_cache: Optional[bool] = None,
+        operator_embedding: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         del attention_mask  # reserved
         B, L_txt = input_ids.shape
@@ -150,6 +151,11 @@ class LunaUltimateFused(nn.Module):
             use_int4_cache = bool(self.config.use_kv_cache_int4) and not self.training
 
         text_embeds = self.embed_tokens(input_ids)
+        if operator_embedding is not None:
+            op = operator_embedding.to(device=device, dtype=text_embeds.dtype)
+            if op.dim() == 2:
+                op = op.unsqueeze(1)
+            text_embeds = text_embeds + op
         vjepa_features = None
         vjepa_loss = torch.zeros((), device=device)
 

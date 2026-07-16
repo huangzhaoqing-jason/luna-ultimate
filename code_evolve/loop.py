@@ -8,7 +8,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from code_evolve.patcher import (
     PatchProposer,
@@ -59,10 +59,19 @@ class CodeEvolveLoop:
         operator_token: Optional[str] = None,
         test_targets: Optional[List[str]] = None,
         sandbox_timeout_s: float = 60.0,
+        safety_ctm: Optional[Any] = None,
     ):
         self.root = root
         self.audit = audit_log or AuditLog(str(root / ".luna" / "audit.log"))
-        self.safety_lock = safety_lock or SafetyLock(self.audit, base_dir=str(root / ".luna"))
+        # Attach the CTM cognitive judge to the safety lock if provided
+        if safety_lock is None and safety_ctm is not None:
+            self.safety_lock = SafetyLock(
+                self.audit, base_dir=str(root / ".luna"), safety_ctm=safety_ctm
+            )
+        else:
+            self.safety_lock = safety_lock or SafetyLock(
+                self.audit, base_dir=str(root / ".luna")
+            )
         self.proposer = proposer or PatchProposer(root=root)
         self.operator_token = operator_token
         self.test_targets = test_targets or []
@@ -155,18 +164,25 @@ def main():
     p.add_argument("--sandbox_timeout_s", type=float, default=60.0)
     p.add_argument("--test_targets", type=str, nargs="*", default=[])
     p.add_argument("--output", type=str, default="./code_evolve_run.json")
+    p.add_argument("--no-ctm", action="store_true",
+                   help="Disable the CTM cognitive judge (charter hard floor still applies)")
     args = p.parse_args()
 
     root = Path(args.root).resolve()
-    # Boot checks
     verify_charter()
-    SafetyTestSuite().run()  # will raise via assert_passes if used at boot
+    SafetyTestSuite().run()
+
+    safety_ctm = None
+    if not args.no_ctm:
+        from safety.cognition import default_safety_ctm
+        safety_ctm = default_safety_ctm()
 
     loop = CodeEvolveLoop(
         root=root,
         operator_token=args.operator_token,
         test_targets=args.test_targets,
         sandbox_timeout_s=args.sandbox_timeout_s,
+        safety_ctm=safety_ctm,
     )
     res = loop.run(max_iterations=args.max_iterations, max_proposals=args.max_proposals)
     payload = asdict(res)
