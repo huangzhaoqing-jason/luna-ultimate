@@ -27,7 +27,8 @@ if str(ROOT) not in sys.path:
 def main() -> None:
     p = argparse.ArgumentParser(description="上传 Luna champion 到 ModelScope")
     p.add_argument("--model_path", type=str, required=True)
-    p.add_argument("--repo_name", type=str, default="luna-champion")
+    p.add_argument("--repo_name", type=str, default="luna-ultimate",
+                   help="ModelScope 仓库名（与 GitHub 仓库 luna-ultimate 对齐）")
     p.add_argument("--namespace", type=str, default="huang18928827157")
     p.add_argument("--upload-weights", action="store_true",
                    help="显式允许上传；缺省只做就绪检查")
