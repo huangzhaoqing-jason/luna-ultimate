@@ -578,6 +578,32 @@ def train(args: argparse.Namespace):
             if rc != 0:
                 logger.warning("distill_ollama exited %s (non-fatal for train)", rc)
 
+        # 训后自动门禁 + ModelScope 上传（默认开；门禁失败则不传）
+        auto_upload = not getattr(args, "no_auto_upload", False)
+        if auto_upload:
+            gate_cmd = [
+                sys.executable,
+                str(Path(__file__).resolve().parent / "scripts" / "post_train_gate_and_upload.py"),
+                "--checkpoint", final_path,
+                "--repo_name", getattr(args, "upload_repo", "luna-ultimate"),
+                "--namespace", getattr(args, "upload_namespace", "huang18928827157"),
+            ]
+            if getattr(args, "skip_safety_gate", False):
+                gate_cmd.append("--skip_safety")
+            logger.info("Post-train gate+upload: %s", " ".join(gate_cmd))
+            rc = subprocess.call(gate_cmd)
+            if rc != 0:
+                logger.error(
+                    "Post-train gate/upload FAILED (rc=%s). "
+                    "Checkpoint kept locally; ModelScope NOT updated.",
+                    rc,
+                )
+                # 不把训练标成失败：权重已落盘；上传失败可重跑门禁脚本
+            else:
+                logger.info("Post-train gate passed; upload attempted (see script log).")
+        else:
+            logger.info("Auto-upload disabled (--no_auto_upload)")
+
     cleanup_distributed()
 
 
@@ -622,6 +648,18 @@ def main():
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument(
+        "--no_auto_upload",
+        action="store_true",
+        help="禁用训后自动门禁上传 ModelScope（默认：训练成功后自动跑门禁并上传）",
+    )
+    parser.add_argument("--upload_repo", type=str, default="luna-ultimate")
+    parser.add_argument("--upload_namespace", type=str, default="huang18928827157")
+    parser.add_argument(
+        "--skip_safety_gate",
+        action="store_true",
+        help="门禁跳过 safety 套件（不推荐）",
+    )
     args = parser.parse_args()
     train(args)
 

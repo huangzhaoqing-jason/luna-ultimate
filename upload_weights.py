@@ -46,8 +46,8 @@ def parse_args():
                         help="ModelScope namespace (default: your username)")
     parser.add_argument("--token", type=str, default=None,
                         help="ModelScope SDK token (or set MODELSCOPE_SDK_TOKEN env var)")
-    parser.add_argument("--revision", type=str, default="main",
-                        help="Git revision to push to")
+    parser.add_argument("--revision", type=str, default="master",
+                        help="Git revision to push to (ModelScope default is often master)")
     parser.add_argument("--shard_size_gb", type=float, default=5.0,
                         help="Target shard size in GB (default: 5)")
     parser.add_argument("--dry_run", action="store_true",
@@ -366,8 +366,24 @@ def upload_to_modelscope(
         else:
             print(f"Warning creating repo: {e}")
 
-    # 整目录上传（新建空仓无 main 分支时 upload_file 会失败；push_model 可建首提交）
+    # ModelScope 新建仓默认分支多为 master（不是 main）
+    try:
+        valid = api.get_valid_revision(full_repo)
+        if valid:
+            revision = valid
+            print(f"  using revision: {revision}")
+    except Exception:
+        pass
+
+    # Hub 兼容：同时提供 configuration.json
+    local_path = Path(local_dir)
+    cfg = local_path / "config.json"
+    conf = local_path / "configuration.json"
+    if cfg.exists() and not conf.exists():
+        conf.write_text(cfg.read_text(encoding="utf-8"), encoding="utf-8")
+
     print(f"  push_model from {local_dir} …")
+    pushed = False
     try:
         api.push_model(
             model_id=full_repo,
@@ -375,21 +391,47 @@ def upload_to_modelscope(
             commit_message=message or f"Upload {repo_name} weights",
             revision=revision,
         )
+        pushed = True
     except TypeError:
-        # 旧版 SDK 可能不接受 revision
         api.push_model(
             model_id=full_repo,
             model_dir=local_dir,
             commit_message=message or f"Upload {repo_name} weights",
         )
+        pushed = True
     except Exception as e:
         print(f"push_model failed ({e}); fallback upload_folder …")
-        api.upload_folder(
-            repo_id=full_repo,
-            folder_path=local_dir,
-            commit_message=message or f"Upload {repo_name} weights",
-            token=token,
+        try:
+            api.upload_folder(
+                repo_id=full_repo,
+                folder_path=local_dir,
+                revision=revision,
+                commit_message=message or f"Upload {repo_name} weights",
+                token=token,
+            )
+            pushed = True
+        except Exception as e2:
+            print(f"ERROR: upload_folder also failed: {e2}")
+            sys.exit(1)
+
+    # 校验：远端应有权重文件
+    try:
+        try:
+            remote_files = api.get_model_files(full_repo, revision=revision)
+        except TypeError:
+            remote_files = api.get_model_files(full_repo)
+        names = {f.get("Path") or f.get("Name") for f in remote_files}
+        has_weights = any(
+            n.endswith(".safetensors") or n.endswith(".bin") for n in names if n
         )
+        if not has_weights:
+            print(f"ERROR: remote has no weight files: {sorted(names)[:20]}")
+            sys.exit(1)
+        print(f"  verified remote files: {len(names)} (weights present)")
+    except Exception as e:
+        print(f"WARNING: could not verify remote files: {e}")
+        if not pushed:
+            sys.exit(1)
 
     print(f"\nUpload complete: {full_repo}")
     print(f"View at: https://modelscope.cn/models/{full_repo}")

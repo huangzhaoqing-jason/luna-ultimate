@@ -53,6 +53,10 @@ torchrun --nproc_per_node=8 train.py --preset 550b \
 
 This is not “rewrite FlashMoE to fit 5GB”. FlashMoE stays Apple-style; the knife-tip is **activation sparsity** (Top-K), not a different architecture.
 
+After a successful `train.py` run, **auto gate + ModelScope upload** runs by default
+(`scripts/post_train_gate_and_upload.py`). Use `--no_auto_upload` to skip. Upload only
+happens if weight/forward/safety gates pass and `MODELSCOPE_TOKEN` is set.
+
 ## Acceptance
 
 Cost-normalized proxy (`scripts/run_eval_proxy.py`) plus external suites in `EVALUATION.md`.

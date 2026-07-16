@@ -62,12 +62,24 @@ evolve 晋升应对齐：质量↑ 且 `safety` 套件 = 1.0。
 
 ## 5. ModelScope 权重（不上 GitHub）
 
-```bash
-# 产出 champion
-python train.py --preset tiny --smoke --output_dir checkpoints/champion
+**默认行为**：`train.py` 训练成功收尾后自动跑门禁并上传（仓库名与 GitHub 对齐：`luna-ultimate`）。
 
-# 有 MODELSCOPE_TOKEN 时上传；无则 ready_no_token
-python scripts/upload_champion.py --model_path checkpoints/champion --upload-weights
+门禁（`scripts/post_train_gate_and_upload.py`）全部通过才上传：
+1. checkpoint 可加载 + 权重无 NaN/Inf  
+2. 短 forward logits 有限  
+3. safety 套件全绿  
+
+```bash
+# 训练（默认自动上传；需 MODELSCOPE_TOKEN）
+python train.py --preset tiny --smoke --data_path data/corpus.txt \
+  --output_dir checkpoints/scale/tiny
+
+# 仅本地、不上传
+python train.py --preset tiny --smoke --no_auto_upload
+
+# 手动重跑门禁+上传
+python scripts/post_train_gate_and_upload.py \
+  --checkpoint checkpoints/scale/tiny/smoke_final.pt
 ```
 
-命名空间默认 `huang18928827157`。
+无 token → `ready_no_token`（不假装已上传）。命名空间默认 `huang18928827157`。
