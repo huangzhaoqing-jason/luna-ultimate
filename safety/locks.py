@@ -1,11 +1,16 @@
-"""Safety locks: the gate every action and every self-evolution mutation passes."""
+"""Safety locks: the gate every action and every self-evolution mutation passes.
+
+Combines the immutable charter (hard floor), kill switch, operator auth, the
+regex action classifier, and the CTM+JEPA cognitive judge. The CTM judge can
+only ADD refusals on top of the charter — it never overturns a charter refusal.
+"""
 
 from __future__ import annotations
 
 import os
 import threading
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 from safety.audit import AuditEntry, AuditLog
 from safety.charter import CharterViolation, verify_charter
@@ -20,6 +25,7 @@ class SafetyDecision:
     reason: str
     operator: Optional[OperatorIdentity]
     audit_id: Optional[str]
+    ctm_trace: Optional[Dict[str, Any]] = None
 
 
 class KillSwitch:
@@ -44,7 +50,7 @@ class KillSwitch:
 
 class SafetyLock:
     """The single gate. Combines charter check, kill switch, operator auth,
-    action classification, and audit.
+    action classification, CTM cognitive judge, and audit.
     """
 
     def __init__(
@@ -53,11 +59,28 @@ class SafetyLock:
         policy: Optional[ActionPolicy] = None,
         kill_switch: Optional[KillSwitch] = None,
         base_dir: str = ".luna",
+        safety_ctm: Optional[Any] = None,
     ):
         self.audit = audit_log
         self.policy = policy or ActionPolicy()
         self.kill = kill_switch or KillSwitch()
         self.base_dir = base_dir
+        self.safety_ctm = safety_ctm  # Optional[SafetyCTM]
+
+    def _audit(
+        self,
+        actor: str,
+        action: str,
+        decision: str,
+        reason: str,
+        context: Optional[dict] = None,
+    ) -> AuditEntry:
+        entry = AuditEntry(
+            actor=actor, action=action[:500], decision=decision,
+            reason=reason, context=context or {},
+        )
+        self.audit.append(entry)
+        return entry
 
     def gate(
         self,
@@ -69,64 +92,83 @@ class SafetyLock:
         try:
             verify_charter()
         except CharterViolation as e:
-            self.audit.append(AuditEntry(
-                actor="system", action="charter_verify_failed",
-                decision="refuse", reason=str(e),
-            ))
+            entry = self._audit("system", "charter_verify_failed", "refuse", str(e))
             return SafetyDecision(False, ActionClass.CHARTER_BYPASS,
                                   f"Charter integrity check failed: {e}",
-                                  None, None)
+                                  None, entry.entry_id)
 
         # 2. Kill switch
         if self.kill.engaged:
-            self.audit.append(AuditEntry(
-                actor="unknown", action=action_text[:200],
-                decision="refuse", reason="kill switch engaged",
-            ))
+            entry = self._audit("unknown", action_text, "refuse",
+                                "kill switch engaged")
             return SafetyDecision(False, ActionClass.REFUSED,
                                   "Refused: kill switch is engaged.",
-                                  None, None)
+                                  None, entry.entry_id)
 
-        # 3. Operator auth (optional for read-only, required for sensitive)
+        # 3. Operator auth
         operator: Optional[OperatorIdentity] = None
         if operator_token:
             try:
                 operator = require_operator(operator_token, self.base_dir)
             except PermissionError as e:
-                self.audit.append(AuditEntry(
-                    actor="unknown", action=action_text[:200],
-                    decision="refuse", reason=f"operator auth failed: {e}",
-                ))
+                entry = self._audit("unknown", action_text, "refuse",
+                                    f"operator auth failed: {e}")
                 return SafetyDecision(False, ActionClass.REFUSED,
                                       f"Operator authorization failed: {e}",
-                                      None, None)
+                                      None, entry.entry_id)
 
-        # 4. Classify
+        # 4. Charter classifier (HARD FLOOR)
         action_class = classify_text(action_text)
-        decision = self.policy.decide(action_class)
-        reason = self.policy.reason(action_class)
+        charter_decision = self.policy.decide(action_class)
+        charter_reason = self.policy.reason(action_class)
+        charter_refuse = (charter_decision == "refuse")
 
         # 5. Sensitive actions require operator auth
         if action_class == ActionClass.SENSITIVE and operator is None:
-            decision = "refuse"
-            reason = "Refused: sensitive action requires operator authorization."
+            charter_refuse = True
+            charter_reason = "Refused: sensitive action requires operator authorization."
 
-        # 6. Audit
-        entry = AuditEntry(
+        # 4b. CTM cognitive judge (SOFT — can only ADD refusals, never remove)
+        ctm_trace: Optional[Dict[str, Any]] = None
+        ctm_refuse = False
+        ctm_reason = ""
+        if self.safety_ctm is not None:
+            try:
+                judgment = self.safety_ctm.judge(action_text, operator=operator)
+                ctm_trace = judgment.trace
+                ctm_refuse = (not judgment.allow)
+                ctm_reason = judgment.reason
+            except Exception as e:
+                # Cognitive loop failure must NEVER open the gate; abstain safely
+                ctm_trace = {"cognition_error": str(e)}
+                ctm_reason = f"SafetyCTM error (abstaining): {e}"
+
+        # Final decision: refuse if EITHER the charter or the CTM refuses.
+        final_refuse = charter_refuse or ctm_refuse
+        decision = "refuse" if final_refuse else "allow"
+        if charter_refuse:
+            reason = charter_reason
+        elif ctm_refuse:
+            reason = ctm_reason
+        else:
+            reason = charter_reason if action_class != ActionClass.SAFE else "Allowed."
+
+        # 6. Audit with full reasoning trace
+        audit_ctx = dict(context or {})
+        if ctm_trace is not None:
+            audit_ctx["ctm_trace"] = ctm_trace
+        entry = self._audit(
             actor=operator.operator_id if operator else "anonymous",
-            action=action_text[:500],
-            decision=decision,
-            reason=reason,
-            context=context or {},
+            action=action_text, decision=decision, reason=reason, context=audit_ctx,
         )
-        self.audit.append(entry)
 
         return SafetyDecision(
-            allowed=(decision == "allow"),
+            allowed=(not final_refuse),
             action_class=action_class,
             reason=reason,
             operator=operator,
             audit_id=entry.entry_id,
+            ctm_trace=ctm_trace,
         )
 
     def gate_code_patch(self, path: str, diff_text: str,
@@ -134,24 +176,19 @@ class SafetyLock:
         """Self-evolution patch gate. safety/ is always refused."""
         norm = path.replace("\\", "/")
         if norm.startswith("safety/") or "/safety/" in norm:
-            decision = self.gate(
-                f"code patch to {path} (safety/ is protected)",
-                operator_token=operator_token,
-                context={"patch_path": path},
-            )
-            # Force refuse regardless of operator
-            entry = AuditEntry(
-                actor=decision.operator.operator_id if decision.operator else "anonymous",
+            # Force refuse regardless of operator or CTM
+            entry = self._audit(
+                actor="unknown",
                 action=f"patch {path}",
                 decision="refuse",
                 reason="Refused: safety/ is immutable; self-evolution cannot modify it.",
                 context={"patch_path": path, "diff": diff_text[:500]},
             )
-            self.audit.append(entry)
             return SafetyDecision(False, ActionClass.CHARTER_BYPASS,
                                   "Refused: safety/ is immutable.",
-                                  decision.operator, entry.entry_id)
-        # Code patches still pass the text classifier on the diff
+                                  None, entry.entry_id,
+                                  {"immutable_safety_dir": True})
+        # Code patches still pass the full gate (charter + CTM) on the diff
         return self.gate(
             f"code patch {path}: {diff_text[:300]}",
             operator_token=operator_token,
