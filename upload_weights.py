@@ -57,6 +57,17 @@ def parse_args():
     return parser.parse_args()
 
 
+def _prepare_weights_for_export(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Drop accidental nested CTM copies and clone shared storages for safetensors."""
+    cleaned: Dict[str, torch.Tensor] = {}
+    for name, tensor in weights.items():
+        if name.startswith("jepa_controller.ctm."):
+            continue
+        # meaning_decoder.lm_head 与 embed_tokens 权重绑定；clone 避免 safetensors 共享内存报错
+        cleaned[name] = tensor.detach().cpu().contiguous().clone()
+    return cleaned
+
+
 def load_model_weights(model_path: str) -> Dict[str, torch.Tensor]:
     """Load model weights from checkpoint directory.
 
@@ -70,7 +81,7 @@ def load_model_weights(model_path: str) -> Dict[str, torch.Tensor]:
     if not path.exists():
         raise FileNotFoundError(f"Model path not found: {model_path}")
 
-    weights = {}
+    weights: Dict[str, torch.Tensor] = {}
 
     # Try safetensors first
     safe_files = sorted(path.glob("*.safetensors"))
@@ -78,32 +89,34 @@ def load_model_weights(model_path: str) -> Dict[str, torch.Tensor]:
         from safetensors.torch import load_file as safe_load
         for f in safe_files:
             weights.update(safe_load(str(f)))
-        return weights
+        return _prepare_weights_for_export(weights)
 
-    # Try pytorch .bin files
-    bin_files = sorted(path.glob("*.bin"))
-    if bin_files:
-        for f in bin_files:
-            weights.update(torch.load(str(f), map_location="cpu"))
-        return weights
-
-    # Try .pt checkpoint (train.py / smoke_final.pt)
+    # Prefer .pt train checkpoints over intermediate .bin exports
     pt_files = list(path.glob("*.pt")) + list(path.glob("*.pth"))
     if pt_files:
         checkpoint = torch.load(str(pt_files[0]), map_location="cpu", weights_only=False)
         if isinstance(checkpoint, dict):
             if "model_state_dict" in checkpoint:
-                return checkpoint["model_state_dict"]
+                return _prepare_weights_for_export(checkpoint["model_state_dict"])
             if "model" in checkpoint:
-                return checkpoint["model"]
-            # flat state_dict
+                return _prepare_weights_for_export(checkpoint["model"])
             if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
-                return checkpoint
-        if isinstance(checkpoint, dict):
+                return _prepare_weights_for_export(checkpoint)
             raise ValueError(
                 f"Unrecognized checkpoint keys in {pt_files[0]}: {list(checkpoint.keys())[:12]}"
             )
-        return checkpoint
+        return _prepare_weights_for_export(checkpoint)
+
+    # Try pytorch .bin files
+    bin_files = sorted(path.glob("*.bin"))
+    if bin_files:
+        for f in bin_files:
+            loaded = torch.load(str(f), map_location="cpu", weights_only=False)
+            if isinstance(loaded, dict) and "model_state_dict" in loaded:
+                weights.update(loaded["model_state_dict"])
+            else:
+                weights.update(loaded)
+        return _prepare_weights_for_export(weights)
 
     raise FileNotFoundError(f"No weight files found in {model_path}")
 
@@ -307,24 +320,28 @@ def upload_to_modelscope(
 ):
     """Upload files to ModelScope Hub."""
     if token is None:
-        token = os.environ.get("MODELSCOPE_SDK_TOKEN")
+        token = os.environ.get("MODELSCOPE_SDK_TOKEN") or os.environ.get("MODELSCOPE_TOKEN")
     if token is None:
         print("ERROR: No ModelScope token provided.")
-        print("Set MODELSCOPE_SDK_TOKEN env variable or use --token flag.")
+        print("Set MODELSCOPE_TOKEN / MODELSCOPE_SDK_TOKEN or use --token flag.")
         print("Get your token at: https://modelscope.cn/my/myaccesstoken")
         sys.exit(1)
 
     os.environ["MODELSCOPE_SDK_TOKEN"] = token
+    os.environ["MODELSCOPE_TOKEN"] = token
 
     try:
         from modelscope.hub.api import HubApi
-        from modelscope.hub.repository import Repository
     except ImportError:
         print("ERROR: modelscope not installed.")
         print("Install with: pip install modelscope")
         sys.exit(1)
 
     api = HubApi()
+    try:
+        api.login(token)
+    except Exception as e:
+        print(f"Warning: api.login failed ({e}); continuing with env token")
 
     if namespace is None:
         user_info = api.get_user_info()
@@ -339,37 +356,40 @@ def upload_to_modelscope(
         api.create_model(
             model_id=full_repo,
             visibility="public",
-            license="Apache 2.0",
+            license="Apache License 2.0",
         )
         print(f"Created repo: {full_repo}")
     except Exception as e:
-        if "already exists" in str(e) or "409" in str(e):
+        err = str(e).lower()
+        if "already exists" in err or "409" in err or "exist" in err:
             print(f"Repo already exists: {full_repo}")
         else:
-            print(f"Warning: {e}")
+            print(f"Warning creating repo: {e}")
 
-    # Upload files
-    local_path = Path(local_dir)
-    files = sorted(local_path.glob("**/*"))
-    files = [f for f in files if f.is_file()]
-
-    total = sum(f.stat().st_size for f in files)
-    uploaded = 0
-
-    for f in files:
-        rel_path = f.relative_to(local_path)
-        size_mb = f.stat().st_size / (1024 * 1024)
-        print(f"  Uploading {rel_path} ({size_mb:.1f} MB)...")
-
-        api.upload_file(
-            path_or_fileobj=str(f),
-            path_in_repo=str(rel_path),
+    # 整目录上传（新建空仓无 main 分支时 upload_file 会失败；push_model 可建首提交）
+    print(f"  push_model from {local_dir} …")
+    try:
+        api.push_model(
             model_id=full_repo,
+            model_dir=local_dir,
+            commit_message=message or f"Upload {repo_name} weights",
             revision=revision,
-            message=message,
         )
-        uploaded += f.stat().st_size
-        print(f"    Progress: {uploaded / (1024 ** 3):.1f} / {total / (1024 ** 3):.1f} GB")
+    except TypeError:
+        # 旧版 SDK 可能不接受 revision
+        api.push_model(
+            model_id=full_repo,
+            model_dir=local_dir,
+            commit_message=message or f"Upload {repo_name} weights",
+        )
+    except Exception as e:
+        print(f"push_model failed ({e}); fallback upload_folder …")
+        api.upload_folder(
+            repo_id=full_repo,
+            folder_path=local_dir,
+            commit_message=message or f"Upload {repo_name} weights",
+            token=token,
+        )
 
     print(f"\nUpload complete: {full_repo}")
     print(f"View at: https://modelscope.cn/models/{full_repo}")
@@ -424,36 +444,23 @@ def main():
     # Copy tokenizer
     prepare_tokenizer(args.model_path, output_dir)
 
-    # Write README for ModelScope
+    # Write README for ModelScope（与 GitHub 仓库名对齐）
+    preset = config.get("preset_name", "unknown")
     readme_path = Path(output_dir) / "README.md"
-    readme_path.write_text("""# Luna-Ultimate 550B
+    readme_path.write_text(f"""---
+license: Apache License 2.0
+---
+# Luna-Ultimate
 
-The world's first CTM × Mamba2-SSD × MLA × FlashMoE hybrid architecture.
+GitHub: https://github.com/huangzhaoqing-jason/luna-ultimate
 
-550B total / 80B active parameters.
-
-## Architecture
-- **Layers 1-12**: Mamba2-SSD (no KV Cache)
-- **Layers 13-32**: MLA (KV compression to 1024-dim)
-- **All 32**: FlashMoE (48 routed + 2 shared experts, Top-4)
-- **Global**: CTM (4096-neuron recurrent, 1-4 adaptive ticks)
+本仓库权重对应代码仓 `luna-ultimate`。当前上传 preset：`{preset}`（研究原型/烟测权重，不等于 550B 全量）。
 
 ## Quick Start
 ```python
 from modelscope import snapshot_download
-from config import LunaConfig
-from modeling_luna_ultimate import LunaUltimateFused
-
-# Download weights
-model_dir = snapshot_download("NAMESPACE/luna-ultimate-550b")
-
-# Load model
-config = LunaConfig()
-model = LunaUltimateFused(config)
-model.load_state_dict_from_safetensors(model_dir)
+model_dir = snapshot_download("huang18928827157/luna-ultimate")
 ```
-
-GitHub: https://github.com/huangzhaoqing-jason/luna-ultimate
 """)
 
     # Step 4: Upload

@@ -52,12 +52,11 @@ class JEPAController(nn.Module):
         super().__init__()
         self.d_model = config.hidden_size
         self.n_neurons = config.ctm_n_neurons
-        self.ctm = ctm
         pred_hidden = min(256, max(32, self.n_neurons // 2))
 
-        # 若 CTM 有 JEPA，复用其 predictor；否则自建
+        # 若 CTM 有 JEPA，复用其 predictor（不注册为子模块，避免 state_dict 重复嵌套）
         if ctm is not None and getattr(ctm, "jepa_predictor", None) is not None:
-            self.predictor = ctm.jepa_predictor
+            object.__setattr__(self, "predictor", ctm.jepa_predictor)
             self._owns_predictor = False
         else:
             self.predictor = CTMJEPAPredictor(

@@ -77,13 +77,16 @@ def main() -> None:
         "--repo_name", args.repo_name,
         "--namespace", args.namespace,
     ]
+    env = os.environ.copy()
     if token:
-        cmd += ["--token", token]
+        # 经环境变量传递，避免把 token 打进进程参数日志
+        env["MODELSCOPE_SDK_TOKEN"] = token
+        env["MODELSCOPE_TOKEN"] = token
     if args.dry_run or force_dry or not token:
         cmd += ["--dry_run"]
 
     print(f"[upload_champion] 调用: {' '.join(cmd)}", flush=True)
-    rc = subprocess.call(cmd, cwd=str(ROOT))
+    rc = subprocess.call(cmd, cwd=str(ROOT), env=env)
     print(f"[upload_champion] status={status} upload_weights_rc={rc}", flush=True)
     sys.exit(rc)
 
