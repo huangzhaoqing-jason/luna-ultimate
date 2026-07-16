@@ -95,40 +95,49 @@
 ### Installation
 
 ```bash
-git clone https://github.com/your-org/luna-ultimate.git
+git clone https://github.com/huangzhaoqing-jason/luna-ultimate.git
 cd luna-ultimate
 pip install -r requirements.txt
+```
+
+### Download Weights (ModelScope)
+
+```bash
+# Download 550B weights from ModelScope (China mirror, fast)
+python download_weights.py \
+    --repo huangzhaoqing-jason/luna-ultimate-550b \
+    --output ./checkpoints
+```
+
+Or via Python:
+
+```python
+from modelscope import snapshot_download
+
+model_dir = snapshot_download("huangzhaoqing-jason/luna-ultimate-550b")
 ```
 
 ### Model Initialization
 
 ```python
 from config import LunaConfig
-from modeling_luna import LunaUltimate
+from modeling_luna_ultimate import LunaUltimateFused
 
 config = LunaConfig()
-model = LunaUltimate(config)
-# Prints: "Total params: 550.32B | Active params: 77.18B"
+model = LunaUltimateFused(config)
 
-# Forward pass
-import torch
-x = torch.randint(0, config.vocab_size, (2, 2048))
-output, aux_loss = model(x)
-print(output.shape)  # [2, 2048, 8192]
+# Load downloaded weights
+model.load_state_dict_from_safetensors("./checkpoints")
 ```
 
-### Inference with Speculative Decoding
+### Upload Weights
 
-```python
-# Generate with Mamba2 drafting + MLA verification
-generated = model.generate(
-    input_ids=x,
-    max_new_tokens=512,
-    use_speculative=True,      # Mamba2 drafts 4 tokens, MLA verifies
-    kv_cache_int4=True,        # INT4 KV cache compression
-    ctm_adaptive_early_exit=True,  # CTM adaptive ticks
-    dynamic_layer_skip=True,   # Skip layers for simple tokens
-)
+```bash
+# After training, upload to ModelScope
+python upload_weights.py \
+    --model_path ./checkpoints/final \
+    --repo_name luna-ultimate-550b \
+    --token YOUR_MODELSCOPE_TOKEN
 ```
 
 ### Training
