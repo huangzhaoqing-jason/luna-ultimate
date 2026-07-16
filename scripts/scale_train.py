@@ -29,6 +29,9 @@ def main():
     p.add_argument("--deepspeed", type=str, default=None)
     p.add_argument("--allow-large", action="store_true")
     p.add_argument("--smoke", action="store_true")
+    p.add_argument("--data_path", type=str, default=None, help="真实文本短训语料")
+    p.add_argument("--distill", action="store_true", help="训后蒸馏钩子")
+    p.add_argument("--modality", type=str, default="text")
     args = p.parse_args()
 
     preset = "550b" if args.preset == "77b_active" else args.preset
@@ -39,6 +42,7 @@ def main():
     cmd = [
         sys.executable, str(ROOT / "train.py"),
         "--preset", preset,
+        "--modality", args.modality,
         "--max_steps", str(args.max_steps),
         "--batch_size", str(args.batch_size),
         "--seq_len", str(args.seq_len),
@@ -48,6 +52,10 @@ def main():
         "--log_every", "1",
         "--save_every", str(max(1, args.max_steps)),
     ]
+    if args.data_path:
+        cmd.extend(["--data_path", args.data_path])
+    if args.distill:
+        cmd.append("--distill")
     if args.smoke or preset == "tiny":
         cmd.append("--smoke")
     if args.deepspeed:

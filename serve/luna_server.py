@@ -84,6 +84,20 @@ class LunaEngine:
         )
         collapse = gen["collapse"]
         text = self._detokenize(gen["generated_ids"][0])
+        # 效率日志：peak VRAM / $/MTok（cost_model）
+        from cost_model import estimate_cost
+        cost = estimate_cost(self.cfg, batch_size=1, seq_len=max(16, ids.shape[1]))
+        cost_info = {
+            "peak_vram_gb": cost.peak_vram_gb,
+            "dollars_per_million_tokens": cost.dollars_per_million_tokens,
+            "active_flops_per_token": cost.active_flops_per_token,
+        }
+        print(
+            f"[luna_serve][cost] peak_vram_gb={cost.peak_vram_gb:.3f} "
+            f"$/MTok={cost.dollars_per_million_tokens:.4f} "
+            f"jepa_unc={out.get('jepa_uncertainty')} "
+            f"ticks={out.get('ctm_ticks_plan')} budget={out.get('expert_budget')}"
+        )
         return {
             "response": text,
             "done": True,
@@ -94,6 +108,10 @@ class LunaEngine:
             "logits_shape": list(out["logits"].shape),
             "device": self.choice.name,
             "backend": self.choice.backend,
+            "jepa_driven": bool(out.get("jepa_driven")),
+            "jepa_uncertainty": out.get("jepa_uncertainty"),
+            "ctm_ticks_plan": out.get("ctm_ticks_plan"),
+            "cost": cost_info,
         }
 
     @torch.no_grad()

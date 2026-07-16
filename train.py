@@ -11,8 +11,11 @@ import argparse
 import logging
 import math
 import os
+import subprocess
+import sys
 import time
 from collections import deque
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -217,6 +220,58 @@ class DummyDataset(torch.utils.data.Dataset):
         return {"input_ids": ids[:-1], "labels": ids[1:]}
 
 
+class FileTextDataset(torch.utils.data.Dataset):
+    """真实文本短训：本地 .txt / 目录 → 伪 token ids（无外部 tokenizer 依赖）。
+
+    用法：``python train.py --preset 1b --modality text --data_path data/corpus.txt``
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        vocab_size: int,
+        seq_len: int,
+        num_samples: Optional[int] = None,
+    ):
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        path = Path(data_path)
+        texts: List[str] = []
+        if path.is_file():
+            texts = [
+                ln.strip()
+                for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if ln.strip()
+            ]
+        elif path.is_dir():
+            for f in sorted(path.rglob("*.txt")):
+                texts.extend(
+                    ln.strip()
+                    for ln in f.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    if ln.strip()
+                )
+        else:
+            raise FileNotFoundError(f"--data_path not found: {data_path}")
+        if not texts:
+            raise ValueError(f"--data_path has no usable lines: {data_path}")
+        self.texts = texts
+        self.num_samples = int(num_samples) if num_samples is not None else max(len(texts), 1)
+
+    def __len__(self):
+        return self.num_samples
+
+    def _encode(self, text: str) -> torch.Tensor:
+        ids = [((ord(c) * 131 + 7) % self.vocab_size) for c in text]
+        if len(ids) < self.seq_len + 1:
+            ids = ids + [0] * (self.seq_len + 1 - len(ids))
+        return torch.tensor(ids[: self.seq_len + 1], dtype=torch.long)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx % len(self.texts)]
+        ids = self._encode(text)
+        return {"input_ids": ids[:-1], "labels": ids[1:]}
+
+
 class DummyImageDataset(torch.utils.data.Dataset):
     """VLM 占位：随机图像 + token。"""
 
@@ -342,12 +397,21 @@ def train(args: argparse.Namespace):
     scaler = GradScaler(enabled=use_amp)
 
     img_size = tuple(config.vjepa_config.get("img_size", (32, 32)))
+    data_path = getattr(args, "data_path", None)
     if modality == "vlm":
         dataset = DummyImageDataset(config.vocab_size, args.seq_len, img_size, args.num_samples)
     elif modality in ("vla", "wa"):
         dataset = DummyEpisodeDataset(config.vocab_size, args.seq_len, img_size, 10, args.num_samples)
+    elif data_path:
+        dataset = FileTextDataset(
+            data_path, config.vocab_size, args.seq_len, args.num_samples
+        )
+        if is_main:
+            logger.info(f"FileTextDataset from {data_path} | lines≈{len(dataset.texts)}")
     else:
         dataset = DummyDataset(config.vocab_size, args.seq_len, args.num_samples)
+        if is_main and modality == "text":
+            logger.info("No --data_path: using DummyDataset (random tokens). For real quality use local corpus.")
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
         dataloader = DataLoader(
@@ -486,14 +550,33 @@ def train(args: argparse.Namespace):
 
     if is_main:
         logger.info(f"Training complete at step {global_step}")
-        if args.smoke:
-            os.makedirs(args.output_dir, exist_ok=True)
-            torch.save({
-                "step": global_step,
-                "model_state_dict": (model.module if hasattr(model, "module") else model).state_dict(),
-                "config": config.to_dict(),
-                "preset": config.preset_name,
-            }, os.path.join(args.output_dir, "smoke_final.pt"))
+        os.makedirs(args.output_dir, exist_ok=True)
+        final_name = "smoke_final.pt" if args.smoke else "final.pt"
+        final_path = os.path.join(args.output_dir, final_name)
+        torch.save({
+            "step": global_step,
+            "model_state_dict": (model.module if hasattr(model, "module") else model).state_dict(),
+            "config": config.to_dict(),
+            "preset": config.preset_name,
+        }, final_path)
+        logger.info(f"Final checkpoint: {final_path}")
+
+        # 意义优先教师蒸馏钩子（复用 export/distill_ollama.py）
+        if getattr(args, "distill", False):
+            distill_out = getattr(args, "distill_out", None) or os.path.join(
+                args.output_dir, "distill"
+            )
+            cmd = [
+                sys.executable,
+                str(Path(__file__).resolve().parent / "export" / "distill_ollama.py"),
+                "--preset", config.preset_name,
+                "--steps", str(getattr(args, "distill_steps", 3)),
+                "--out", distill_out,
+            ]
+            logger.info("Distill hook: %s", " ".join(cmd))
+            rc = subprocess.call(cmd)
+            if rc != 0:
+                logger.warning("distill_ollama exited %s (non-fatal for train)", rc)
 
     cleanup_distributed()
 
@@ -509,6 +592,19 @@ def main():
         choices=["text", "vlm", "vla", "wa"],
         help="训练模态：text / vlm / vla / wa（占位数据）",
     )
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default=None,
+        help="真实文本路径（.txt 或目录）；1b 短训入口",
+    )
+    parser.add_argument(
+        "--distill",
+        action="store_true",
+        help="训后调用 export/distill_ollama.py 做意义优先教师蒸馏钩子",
+    )
+    parser.add_argument("--distill_steps", type=int, default=3)
+    parser.add_argument("--distill_out", type=str, default=None)
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=1)

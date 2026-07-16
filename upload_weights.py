@@ -87,12 +87,22 @@ def load_model_weights(model_path: str) -> Dict[str, torch.Tensor]:
             weights.update(torch.load(str(f), map_location="cpu"))
         return weights
 
-    # Try .pt checkpoint
+    # Try .pt checkpoint (train.py / smoke_final.pt)
     pt_files = list(path.glob("*.pt")) + list(path.glob("*.pth"))
     if pt_files:
-        checkpoint = torch.load(str(pt_files[0]), map_location="cpu")
-        if isinstance(checkpoint, dict) and "model" in checkpoint:
-            return checkpoint["model"]
+        checkpoint = torch.load(str(pt_files[0]), map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, dict):
+            if "model_state_dict" in checkpoint:
+                return checkpoint["model_state_dict"]
+            if "model" in checkpoint:
+                return checkpoint["model"]
+            # flat state_dict
+            if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+                return checkpoint
+        if isinstance(checkpoint, dict):
+            raise ValueError(
+                f"Unrecognized checkpoint keys in {pt_files[0]}: {list(checkpoint.keys())[:12]}"
+            )
         return checkpoint
 
     raise FileNotFoundError(f"No weight files found in {model_path}")
@@ -230,48 +240,60 @@ def save_sharded_bin(
     return saved_files
 
 
-def get_model_config() -> dict:
-    """Build model config dict for ModelScope."""
+def get_model_config(model_path: Optional[str] = None) -> dict:
+    """Build model config dict for ModelScope.
+
+    Prefer ``config.json`` next to weights (e.g. tiny champion); else LunaConfig defaults.
+    """
     from config import LunaConfig
+
+    if model_path:
+        cfg_file = Path(model_path) / "config.json"
+        if cfg_file.exists():
+            raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+            raw.setdefault("model_type", "luna_ultimate")
+            raw.setdefault("architectures", ["LunaUltimateFused"])
+            return raw
+
     config = LunaConfig()
     return {
         "model_type": "luna_ultimate",
         "architectures": ["LunaUltimateFused"],
+        "preset_name": config.preset_name,
         "hidden_size": config.hidden_size,
         "num_hidden_layers": config.num_hidden_layers,
         "mamba2_layers": config.mamba2_layers,
         "mla_layers": config.mla_layers,
-        "num_attention_heads": config.num_attention_heads,
-        "num_key_value_heads": config.num_key_value_heads,
+        "n_heads": config.n_heads,
         "intermediate_size": config.intermediate_size,
         "vocab_size": config.vocab_size,
         "max_position_embeddings": config.max_position_embeddings,
         "rms_norm_eps": config.rms_norm_eps,
-        "tie_word_embeddings": config.tie_word_embeddings,
+        "tie_word_embeddings": True,
         # MoE
         "num_routed_experts": config.num_routed_experts,
         "num_shared_experts": config.num_shared_experts,
-        "num_experts_per_tok": config.num_experts_per_tok,
-        "expert_hidden_size": config.expert_hidden_size,
+        "num_expert_activated": config.num_expert_activated,
         # Mamba2
-        "d_state": config.d_state,
-        "d_conv": config.d_conv,
-        "expand": config.expand,
+        "mamba_d_state": config.mamba_d_state,
+        "mamba_d_conv": config.mamba_d_conv,
+        "mamba_expand": config.mamba_expand,
         # MLA
         "q_lora_rank": config.q_lora_rank,
         "kv_lora_rank": config.kv_lora_rank,
         "qk_nope_head_dim": config.qk_nope_head_dim,
         "qk_rope_head_dim": config.qk_rope_head_dim,
         "v_head_dim": config.v_head_dim,
-        # CTM
+        # CTM / JEPA 总控
         "ctm_n_neurons": config.ctm_n_neurons,
         "ctm_nlm_hidden": config.ctm_nlm_hidden,
         "ctm_max_ticks": config.ctm_max_ticks,
-        "ctm_jepa_enabled": getattr(config, "ctm_jepa_enabled", True),
-        "ctm_jepa_horizon": getattr(config, "ctm_jepa_horizon", 1),
-        "ctm_jepa_ema_decay": getattr(config, "ctm_jepa_ema_decay", 0.996),
-        # V-JEPA
-        "vjepa_config": getattr(config, "vjepa_config", {}),
+        "ctm_jepa_enabled": config.ctm_jepa_enabled,
+        "ctm_jepa_horizon": config.ctm_jepa_horizon,
+        "ctm_jepa_ema_decay": config.ctm_jepa_ema_decay,
+        "jepa_control_enabled": config.jepa_control_enabled,
+        "route_mode": config.route_mode,
+        "vjepa_config": config.vjepa_config,
     }
 
 
@@ -387,10 +409,11 @@ def main():
 
     # Step 2: Prepare config
     print("\n[2/4] Building model config...")
-    config = get_model_config()
-    print(f"  Model type: {config['model_type']}")
-    print(f"  Hidden size: {config['hidden_size']}")
-    print(f"  Layers: {config['num_hidden_layers']}")
+    config = get_model_config(args.model_path)
+    print(f"  Model type: {config.get('model_type')}")
+    print(f"  Hidden size: {config.get('hidden_size')}")
+    print(f"  Layers: {config.get('num_hidden_layers')}")
+    print(f"  Preset: {config.get('preset_name', 'unknown')}")
 
     # Step 3: Save sharded weights
     output_dir = "/tmp/luna_upload"

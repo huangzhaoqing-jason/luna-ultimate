@@ -52,6 +52,12 @@ class LunaConfig:
     ctm_jepa_horizon: int = 1
     ctm_jepa_ema_decay: float = 0.996
 
+    # ==================== JEPA 总控 ====================
+    # jepa：ControlSignals → plan_from_jepa；heuristic：关键词丘脑（对照）
+    jepa_control_enabled: bool = True
+    route_mode: str = "jepa"  # "jepa" | "heuristic"
+    motor_enabled: bool = True
+
     # ==================== V-JEPA ====================
     vjepa_enabled: bool = True
     vjepa_config: dict = field(default_factory=lambda: {

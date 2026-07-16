@@ -18,6 +18,7 @@ from loss_manager import StageAwareLossManager
 from modeling_ctm import CTM
 from modeling_flashmoe import FlashMoE
 from modeling_mamba2 import Mamba2Block
+from modeling_jepa_control import ControlSignals, JEPAController
 from modeling_meaning import CollapseDetector, MeaningFirstDecoder, MeaningPlanner
 from modeling_mla import MLABlock
 from modeling_thalamus import RoutePlan, ThalamusRouter
@@ -85,6 +86,14 @@ class LunaUltimateFused(nn.Module):
         self.meaning_decoder = MeaningFirstDecoder(config, lm_head=self.lm_head)
         self.collapse_detector = CollapseDetector()
         self.last_route_plan: Optional[RoutePlan] = None
+        self.last_jepa_signals: Optional[ControlSignals] = None
+
+        # JEPA 总控：驱动丘脑 / ticks / MoE / Meaning / Motor / WA
+        self.jepa_control_enabled = bool(getattr(config, "jepa_control_enabled", True))
+        if self.jepa_control_enabled:
+            self.jepa_controller = JEPAController(config, ctm=self.ctm)
+        else:
+            self.jepa_controller = None
 
         # 脑区模块（按需接入；tiny 上轻量）
         from modeling_cerebellum import CerebellarCorrector
@@ -268,12 +277,19 @@ class LunaUltimateFused(nn.Module):
         if use_int4_cache is None:
             use_int4_cache = bool(self.config.use_kv_cache_int4) and not self.training
 
-        # 丘脑：按任务类型真调度（CTM ticks / MoE / layer-skip / 脑区开关）
+        jepa_on = (
+            self.jepa_control_enabled
+            and self.jepa_controller is not None
+            and getattr(self.config, "route_mode", "jepa") == "jepa"
+        )
+        # 启发式路径：文本分类先出 plan；JEPA 路径：嵌入后再 plan_from_jepa
         plan: Optional[RoutePlan] = None
-        if route_text is not None:
-            plan = self.thalamus.plan_from_text(route_text)
-        elif compute_vla or visual_input is not None:
-            plan = self.thalamus.plan_from_text("vision planning action")
+        jepa_signals: Optional[ControlSignals] = None
+        if not jepa_on:
+            if route_text is not None:
+                plan = self.thalamus.plan_from_text(route_text)
+            elif compute_vla or visual_input is not None:
+                plan = self.thalamus.plan_from_text("vision planning action")
         self.last_route_plan = plan
         prev_route = self._apply_route(plan)
 
@@ -289,6 +305,47 @@ class LunaUltimateFused(nn.Module):
 
             if visual_input is not None and self.vjepa is not None:
                 vjepa_features, vjepa_loss, _ = self.vjepa(visual_input)
+
+            # —— JEPA 总控：ControlSignals → 丘脑真调度 ——
+            if jepa_on:
+                jepa_signals = self.jepa_controller(
+                    text_embeds,
+                    vision_latent=vjepa_features,
+                )
+                plan = self.thalamus.plan_from_jepa(jepa_signals)
+                # 冷启动：有 route_text 时用启发式任务类 + JEPA scale/wake
+                # （未训 JEPA task_head 时仍能拉开 ticks/budget）
+                if route_text:
+                    heur = self.thalamus.plan_from_text(route_text)
+                    plan = self.thalamus._plan(
+                        heur.task_type,
+                        (
+                            f"jepa+text:{heur.task_type.value}:"
+                            f"unc={jepa_signals.uncertainty:.2f}:"
+                            f"scale={jepa_signals.compute_scale:.2f}"
+                        ),
+                        compute_scale=jepa_signals.compute_scale,
+                        wake_override=set(plan.wake) | set(heur.wake),
+                    )
+                elif compute_vla or visual_input is not None:
+                    heur = self.thalamus.plan_from_text("vision planning action")
+                    plan = self.thalamus._plan(
+                        heur.task_type,
+                        f"jepa+vision:unc={jepa_signals.uncertainty:.2f}",
+                        compute_scale=jepa_signals.compute_scale,
+                        wake_override=set(plan.wake) | set(heur.wake),
+                    )
+                self._restore_route(prev_route)
+                prev_route = self._apply_route(plan)
+                self.last_route_plan = plan
+                self.last_jepa_signals = jepa_signals
+                outputs["jepa_driven"] = True
+                outputs["jepa_uncertainty"] = jepa_signals.uncertainty
+                outputs["jepa_compute_scale"] = jepa_signals.compute_scale
+                outputs["jepa_ctrl"] = jepa_signals.jepa_ctrl
+                outputs["jepa_next_latent"] = jepa_signals.next_latent
+            else:
+                outputs["jepa_driven"] = False
 
             # —— 小脑缓存命中快路径（最省算力）——
             cache_hit = None
@@ -429,6 +486,7 @@ class LunaUltimateFused(nn.Module):
             # 默认 meaning_first：目标语义调制 logits（无 AR fallback）
             target_meaning = None
             recon_loss = torch.zeros((), device=device)
+            jepa_ctrl = jepa_signals.jepa_ctrl if jepa_signals is not None else None
             if mode == "meaning_first":
                 # 仅用文本段做意义规划（跳过视觉/RAG 前缀）
                 prefix = 0
@@ -437,7 +495,7 @@ class LunaUltimateFused(nn.Module):
                 if outputs.get("rag_hits"):
                     prefix += rag_prefix.shape[1]  # type: ignore[union-attr]
                 prompt_h = hidden_states[:, prefix:, :] if prefix else hidden_states
-                target_meaning = self.meaning_planner.plan(prompt_h)
+                target_meaning = self.meaning_planner.plan(prompt_h, jepa_ctrl=jepa_ctrl)
                 md_out = self.meaning_decoder(
                     hidden_states,
                     target_meaning,
@@ -461,6 +519,7 @@ class LunaUltimateFused(nn.Module):
                 outputs["thalamus_wake"] = sorted(plan.wake)
                 outputs["thalamus_sub_regions"] = plan.sub_regions
                 outputs["ctm_ticks_plan"] = plan.ctm_ticks
+                outputs["thalamus_reason"] = plan.reason
 
             # VLA / World-Action 头（按需）
             if compute_vla and self.action_head is not None:
@@ -476,7 +535,9 @@ class LunaUltimateFused(nn.Module):
 
             if compute_wa and self.world_action is not None:
                 wa_out = self.world_action(
-                    hidden_states, next_obs_hidden=next_visual_hidden
+                    hidden_states,
+                    next_obs_hidden=next_visual_hidden,
+                    jepa_ctrl=jepa_ctrl,
                 )
                 outputs["world_current"] = wa_out.current_latent
                 outputs["world_next"] = wa_out.next_latent
@@ -486,7 +547,9 @@ class LunaUltimateFused(nn.Module):
 
             # 运动动作中枢（M1/premotor/SMA）— 仅产出 ActionSpec，执行在 serve/action/
             if plan is not None and plan.enable_action and self.motor is not None and route_text:
-                motor_out = self.motor.plan_actions(hidden_states, intent=route_text)
+                motor_out = self.motor.plan_actions(
+                    hidden_states, intent=route_text, jepa_ctrl=jepa_ctrl
+                )
                 outputs["motor_actions"] = motor_out  # type: ignore[assignment]
 
             avg_ticks = float(sum(tick_list) / max(1, len(tick_list))) if not outputs.get("cache_hit") else 0.0
@@ -548,6 +611,9 @@ class LunaUltimateFused(nn.Module):
             "target_meaning": target_meaning,
             "collapse": report,
             "route": self.last_route_plan,
+            "jepa_signals": self.last_jepa_signals,
+            "jepa_driven": bool(out.get("jepa_driven")),
+            "jepa_uncertainty": out.get("jepa_uncertainty"),
             "decode_mode": "meaning_first",
             "ar_fallback": False,
         }

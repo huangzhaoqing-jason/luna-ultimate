@@ -172,7 +172,15 @@ class MotorCortex(nn.Module):
         self.m1 = M1ActionHead(config)
         self.premotor = PremotorPlanner(config)
 
-    def plan_actions(self, hidden: torch.Tensor, intent: str) -> Dict[str, Any]:
+    def plan_actions(
+        self,
+        hidden: torch.Tensor,
+        intent: str,
+        jepa_ctrl: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        # JEPA 总控条件化：ctrl 残差注入再进 M1/premotor
+        if jepa_ctrl is not None:
+            hidden = hidden + 0.25 * jepa_ctrl.unsqueeze(1)
         m1_out = self.m1(hidden)
         dag = self.premotor(hidden, m1_out, intent=intent)
         return {
@@ -184,5 +192,6 @@ class MotorCortex(nn.Module):
                 "retries": int(m1_out["retries"][0].item()),
             },
             "dag": dag,
+            "jepa_conditioned": jepa_ctrl is not None,
             "sma_hit": dag is not None and any(n.name in {t.name for d in self.premotor.sma.templates.values() for t in d.nodes} for n in dag.nodes),
         }

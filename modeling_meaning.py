@@ -52,13 +52,24 @@ class MeaningPlanner(nn.Module):
         # target neuron state → 目标语义 latent (d_model)
         self.to_meaning = nn.Linear(self.n_neurons, self.d_model, bias=False)
         self.norm = nn.LayerNorm(self.d_model)
+        # JEPA 总控条件化：meaning ⊕ jepa_ctrl
+        self.ctrl_fuse = nn.Linear(self.d_model * 2, self.d_model, bias=False)
 
-    def plan(self, prompt_hidden: torch.Tensor) -> torch.Tensor:
-        """prompt_hidden: [B, L, d] → target_meaning: [B, d]"""
+    def plan(
+        self,
+        prompt_hidden: torch.Tensor,
+        jepa_ctrl: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """prompt_hidden: [B, L, d] → target_meaning: [B, d]
+
+        若提供 jepa_ctrl [B, d]，与目标语义融合（JEPA 总控条件化）。
+        """
         pooled = prompt_hidden.mean(dim=1)              # [B, d]
         neuron_state = self.to_neurons(pooled)          # [B, n_neurons]
         target_neurons = self.target_encoder(neuron_state)  # [B, n_neurons]
         meaning = self.to_meaning(target_neurons)       # [B, d]
+        if jepa_ctrl is not None:
+            meaning = self.ctrl_fuse(torch.cat([meaning, jepa_ctrl], dim=-1))
         return self.norm(meaning)
 
 

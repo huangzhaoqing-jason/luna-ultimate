@@ -55,8 +55,12 @@ class WorldActionModule(nn.Module):
         self,
         obs_hidden: torch.Tensor,
         next_obs_hidden: Optional[torch.Tensor] = None,
+        jepa_ctrl: Optional[torch.Tensor] = None,
     ) -> WorldActionOutput:
         current = self.encode_obs(obs_hidden)
+        # JEPA 总控条件化：世界 latent 受 jepa_ctrl 调制
+        if jepa_ctrl is not None:
+            current = current + 0.25 * jepa_ctrl
         next_pred = self.predictor(current)
         prior = self.action_prior(current)
 
