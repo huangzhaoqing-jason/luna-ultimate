@@ -1,7 +1,12 @@
-"""丘脑动态路由（GWT）：按任务类型按需唤醒脑区。
+"""丘脑动态路由（GWT）：按任务类型按需唤醒脑区 + 真调度开关。
 
-简单任务只唤醒小脑+少量专家（~10% 算力）；中等任务唤醒颞叶+前额叶（~30%）；
-顶级复杂推理才全脑激活。这是「低算力高性能」的核心保障。
+RoutePlan 现在携带可被 forward 真消费的开关：
+  - ctm_ticks：CTM 自适应 tick 上限（简单任务 1，复杂 4）
+  - enable_layer_skip：是否允许动态跳层
+  - enable_rag / enable_parietal / enable_hippo / enable_cerebellum / enable_action
+  - cache_lookup：小脑缓存命中即跳主干（最省算力路径）
+
+简单任务 ~10% 算力；中等 ~30%；顶级复杂才全脑。
 """
 
 from __future__ import annotations
@@ -9,45 +14,56 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Sequence, Set
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from config import LunaConfig
+from modeling_neuroarch import SubRegion, subregions_for_task
 
 
 class TaskType(enum.Enum):
-    SIMPLE = "simple"          # 常规补全/闲聊 → 小脑
-    KNOWLEDGE = "knowledge"    # 事实/检索 → 颞叶
-    MATH = "math"              # 数学/符号 → 顶叶
-    CODE = "code"              # 代码 → 前额叶+小脑+颞叶
-    REASONING = "reasoning"    # 复杂推理 → 前额叶+顶叶+颞叶
-    FULL = "full"              # 全脑
+    SIMPLE = "simple"
+    KNOWLEDGE = "knowledge"
+    MATH = "math"
+    CODE = "code"
+    REASONING = "reasoning"
+    ACTION = "action"        # 需要落地执行（M1/premotor/SMA）
+    FULL = "full"
 
 
 @dataclass
 class RoutePlan:
     task_type: TaskType
-    wake: Set[str]             # 脑区名集合
-    expert_budget: float       # 0-1，专家激活比例预算
-    use_cerebellum_cache: bool = False
-    use_parietal: bool = False
-    use_rag: bool = False
+    wake: Set[str]
+    sub_regions: List[str] = field(default_factory=list)
+    expert_budget: float = 0.25
+    # —— 真调度开关 ——
+    ctm_ticks: int = 2
+    enable_layer_skip: bool = False
+    enable_rag: bool = False
+    enable_parietal: bool = False
+    enable_hippo: bool = False
+    enable_cerebellum: bool = True
+    enable_action: bool = False
+    cache_lookup: bool = True   # 小脑缓存优先
     reason: str = ""
 
 
-# 关键词启发式路由（轻量，CPU 友好；生产可换分类器）
 _MATH_PAT = re.compile(r"\b(math|方程|积分|证明|theorem|prove|geometry|代数|微积分)\b", re.I)
-_CODE_PAT = re.compile(r"\b(code|python|function|bug|算法|编程|script|refactor|API)\b", re.I)
+_CODE_PAT = re.compile(r"\b(code|python|function|bug|算法|编程|script|refactor|API|编译|build)\b", re.I)
 _REASON_PAT = re.compile(r"\b(为什么|why|how to|plan|推理|证明|设计|架构|strategy)\b", re.I)
 _KNOW_PAT = re.compile(r"\b(什么是|what is|who|when|事实|定义|explain)\b", re.I)
+_ACTION_PAT = re.compile(r"\b(执行|run|提交|commit|push|clone|部署|deploy|操作|终端|terminal|git)\b", re.I)
 
 
 def classify_task(text: str) -> TaskType:
     if not text or not text.strip():
         return TaskType.SIMPLE
+    if _ACTION_PAT.search(text) and (_CODE_PAT.search(text) or "git" in text.lower()):
+        return TaskType.ACTION
     if _MATH_PAT.search(text):
         return TaskType.MATH
     if _CODE_PAT.search(text):
@@ -59,16 +75,26 @@ def classify_task(text: str) -> TaskType:
     return TaskType.SIMPLE
 
 
-# 任务类型 → 唤醒脑区
+_TASK_KEY: Dict[TaskType, str] = {
+    TaskType.SIMPLE: "chat",
+    TaskType.KNOWLEDGE: "memory",
+    TaskType.MATH: "math",
+    TaskType.CODE: "code",
+    TaskType.REASONING: "planning",
+    TaskType.ACTION: "action",
+    TaskType.FULL: "planning",
+}
+
 _WAKE_MAP: Dict[TaskType, Set[str]] = {
     TaskType.SIMPLE: {"cerebellum", "thalamus"},
-    TaskType.KNOWLEDGE: {"temporal", "thalamus", "rag"},
-    TaskType.MATH: {"parietal", "prefrontal", "thalamus"},
-    TaskType.CODE: {"prefrontal", "cerebellum", "temporal", "thalamus"},
-    TaskType.REASONING: {"prefrontal", "parietal", "temporal", "thalamus"},
+    TaskType.KNOWLEDGE: {"temporal", "thalamus", "hippocampus"},
+    TaskType.MATH: {"parietal", "prefrontal", "thalamus", "cerebellum"},
+    TaskType.CODE: {"prefrontal", "cerebellum", "temporal", "thalamus", "motor"},
+    TaskType.REASONING: {"prefrontal", "parietal", "temporal", "thalamus", "cerebellum"},
+    TaskType.ACTION: {"motor", "prefrontal", "cerebellum", "brainstem", "thalamus"},
     TaskType.FULL: {
         "prefrontal", "parietal", "temporal", "cerebellum",
-        "hippocampus", "thalamus", "rag",
+        "hippocampus", "thalamus", "motor", "brainstem",
     },
 }
 
@@ -78,54 +104,63 @@ _BUDGET_MAP: Dict[TaskType, float] = {
     TaskType.MATH: 0.35,
     TaskType.CODE: 0.40,
     TaskType.REASONING: 0.55,
+    TaskType.ACTION: 0.45,
     TaskType.FULL: 1.0,
+}
+
+_CTM_TICKS_MAP: Dict[TaskType, int] = {
+    TaskType.SIMPLE: 1,
+    TaskType.KNOWLEDGE: 2,
+    TaskType.MATH: 3,
+    TaskType.CODE: 3,
+    TaskType.REASONING: 4,
+    TaskType.ACTION: 2,
+    TaskType.FULL: 4,
 }
 
 
 class ThalamusRouter(nn.Module):
-    """丘脑路由器：文本 → RoutePlan；可选学到的路由头（训练时用）。"""
+    """丘脑路由器：文本/hidden → RoutePlan（含真调度开关）。"""
 
     def __init__(self, config: LunaConfig):
         super().__init__()
         self.config = config
         self.d_model = config.hidden_size
-        # 可学习路由头（可选，默认用启发式；训练时可用）
         n_types = len(TaskType)
         self.route_head = nn.Linear(self.d_model, n_types, bias=False)
         self._type_list = list(TaskType)
 
+    def _plan(self, t: TaskType, reason: str) -> RoutePlan:
+        wake = set(_WAKE_MAP[t])
+        subs = [s.value for s in subregions_for_task(_TASK_KEY[t])]
+        return RoutePlan(
+            task_type=t,
+            wake=wake,
+            sub_regions=subs,
+            expert_budget=_BUDGET_MAP[t],
+            ctm_ticks=_CTM_TICKS_MAP[t],
+            enable_layer_skip=(t in (TaskType.SIMPLE, TaskType.KNOWLEDGE)),
+            enable_rag=(t in (TaskType.KNOWLEDGE, TaskType.CODE, TaskType.FULL)),
+            enable_parietal=(t in (TaskType.MATH, TaskType.REASONING, TaskType.FULL, TaskType.CODE)),
+            enable_hippo=(t in (TaskType.REASONING, TaskType.ACTION, TaskType.FULL, TaskType.KNOWLEDGE)),
+            enable_cerebellum=True,
+            enable_action=(t in (TaskType.ACTION, TaskType.CODE, TaskType.FULL)),
+            cache_lookup=(t == TaskType.SIMPLE),
+            reason=reason,
+        )
+
     def plan_from_text(self, text: str) -> RoutePlan:
         t = classify_task(text)
-        wake = set(_WAKE_MAP[t])
-        return RoutePlan(
-            task_type=t,
-            wake=wake,
-            expert_budget=_BUDGET_MAP[t],
-            use_cerebellum_cache=(t == TaskType.SIMPLE),
-            use_parietal=(t in (TaskType.MATH, TaskType.REASONING, TaskType.FULL)),
-            use_rag=(t in (TaskType.KNOWLEDGE, TaskType.CODE, TaskType.FULL)),
-            reason=f"heuristic:{t.value}",
-        )
+        return self._plan(t, f"heuristic:{t.value}")
 
     def plan_from_hidden(self, prompt_hidden: torch.Tensor) -> RoutePlan:
-        """用学到的路由头（训练稳定性对照）；推理默认用 plan_from_text。"""
-        pooled = prompt_hidden.mean(dim=1)  # [B, d]
-        logits = self.route_head(pooled)    # [B, n_types]
+        pooled = prompt_hidden.mean(dim=1)
+        logits = self.route_head(pooled)
         idx = int(logits[0].argmax().item())
         t = self._type_list[idx]
-        wake = set(_WAKE_MAP[t])
-        return RoutePlan(
-            task_type=t,
-            wake=wake,
-            expert_budget=_BUDGET_MAP[t],
-            use_cerebellum_cache=(t == TaskType.SIMPLE),
-            use_parietal=(t in (TaskType.MATH, TaskType.REASONING, TaskType.FULL)),
-            use_rag=(t in (TaskType.KNOWLEDGE, TaskType.CODE, TaskType.FULL)),
-            reason=f"learned:{t.value}",
-        )
+        return self._plan(t, f"learned:{t.value}")
 
     def expert_top_k(self, config: LunaConfig, plan: RoutePlan) -> int:
-        """按预算缩放 top_k，简单任务少激活专家。"""
         base = config.num_expert_activated
-        k = max(1, int(round(base * plan.expert_budget * 2)))  # 粗缩放
+        k = max(1, int(round(base * plan.expert_budget * 2)))
         return min(k, config.num_routed_experts)
