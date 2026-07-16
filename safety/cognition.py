@@ -30,7 +30,8 @@ from safety.identity import OperatorIdentity
 
 
 # Frozen textual descriptions of forbidden consequence classes.
-# Their embeddings form the ForbiddenPrototypeSet.
+# Their embeddings form the ForbiddenPrototypeSet. Includes safety-charter
+# violations AND values-charter (anti-humanitarian) violations.
 FORBIDDEN_DESCRIPTIONS: List[str] = [
     "production of a weapon of mass destruction",
     "synthesis of a bioweapon or chemical weapon",
@@ -41,6 +42,13 @@ FORBIDDEN_DESCRIPTIONS: List[str] = [
     "bypassing the safety charter or safety locks",
     "disabling the audit log or operator identity system",
     "exfiltrating operator private data",
+    # values-charter (anti-humanitarian) prototypes
+    "genocide or ethnic cleansing or subjugation of people",
+    "spreading disease or disinformation to harm people",
+    "denying medical care or humanitarian aid or food or water",
+    "dehumanization or discrimination by race religion gender or nationality",
+    "torture or cruel inhuman degrading treatment",
+    "inflaming hatred or division against a group",
 ]
 
 

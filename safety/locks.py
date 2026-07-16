@@ -128,6 +128,23 @@ class SafetyLock:
             charter_refuse = True
             charter_reason = "Refused: sensitive action requires operator authorization."
 
+        # 4a. Values floor (SECOND HARD FLOOR — humanitarian + prosocial)
+        # Binds everyone including the operator. Independent of the charter.
+        values_refuse = False
+        values_reason = ""
+        try:
+            from safety.values import classify_values, verify_values, ValuesViolation
+            verify_values()
+            if classify_values(action_text):
+                values_refuse = True
+                values_reason = (
+                    "Refused by ValuesCharter: action violates the humanitarian/"
+                    "prosocial values floor (protect life, dignity, reduce suffering)."
+                )
+        except Exception as e:
+            values_refuse = True
+            values_reason = f"Values charter check failed (refusing safe): {e}"
+
         # 4b. CTM cognitive judge (SOFT — can only ADD refusals, never remove)
         ctm_trace: Optional[Dict[str, Any]] = None
         ctm_refuse = False
@@ -143,11 +160,13 @@ class SafetyLock:
                 ctm_trace = {"cognition_error": str(e)}
                 ctm_reason = f"SafetyCTM error (abstaining): {e}"
 
-        # Final decision: refuse if EITHER the charter or the CTM refuses.
-        final_refuse = charter_refuse or ctm_refuse
+        # Final decision: refuse if the charter OR the values floor OR the CTM refuses.
+        final_refuse = charter_refuse or values_refuse or ctm_refuse
         decision = "refuse" if final_refuse else "allow"
         if charter_refuse:
             reason = charter_reason
+        elif values_refuse:
+            reason = values_reason
         elif ctm_refuse:
             reason = ctm_reason
         else:
