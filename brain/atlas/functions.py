@@ -94,9 +94,13 @@ _AIXI_HOOK: Dict[str, str] = {
 
 def _micro_line(spec: AreaSpec) -> str:
     caps = ",".join(spec.capabilities)
+    # Unique per-area micro story (column id, hemi, macro slot, caps)
+    slot = (spec.area_id - 1) % 17
     return (
-        f"Column {spec.area_id:03d}/{spec.hemisphere}: low-rank adapter over shared "
-        f"backbone; local pulse/feature residual; caps=[{caps}]."
+        f"BNA#{spec.area_id:03d}/{spec.hemisphere} macro={spec.macro} slot={slot}: "
+        f"LIF-lite column (leak·V→σ-spike) on shared backbone; "
+        f"residual amp∝gate; caps=[{caps}]; "
+        f"readable weights in AreaColumn.in_proj/out_proj."
     )
 
 

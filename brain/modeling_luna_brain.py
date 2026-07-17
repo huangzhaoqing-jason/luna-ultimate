@@ -1,15 +1,13 @@
-"""LunaBrain: AIXI-directed × 246 white-box atlas × BriLLM/SiFu speech (自研)."""
+"""LunaBrain: AIXI-orchestrated × 246 white-box atlas × SiFu speech (全栈自研)."""
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 
-from brain.aixi.agent import AIXIApprox
-from brain.aixi.scheduler import AIXIGlobalScheduler
-from brain.aixi.whitebox import AIXIWhiteBoxPlanner
+from brain.aixi.orchestrator import AIXIOrchestrator
 from brain.atlas.analyzer import AtlasAnalyzer
 from brain.atlas.network import BrainnetomeNetwork
 from brain.atlas.brainnetome246 import NUM_AREAS, capability_coverage
@@ -27,7 +25,7 @@ from config_brain import BrainConfig, prototype_config
 
 
 class LunaBrain(nn.Module):
-    """Whole-brain agent: AIXI schedules globally; every step is white-box."""
+    """Whole-brain agent: AIXI orchestrates globally; every step is white-box."""
 
     def __init__(self, config: Optional[BrainConfig] = None):
         super().__init__()
@@ -45,14 +43,8 @@ class LunaBrain(nn.Module):
             d_area=self.config.d_area,
             backbone_layers=self.config.backbone_layers,
         )
-        self.scheduler = AIXIGlobalScheduler(
-            d_state=d,
-            n_hypotheses=self.config.n_hypotheses,
-            horizon=self.config.aixi_horizon,
-            thalamus=self.thalamus,
-        )
-        self.multitask = MultiTaskRuntime(d, n_slots=self.config.n_goal_slots)
-        self.aixi = AIXIApprox(
+        # Single AIXI owner for schedule + action + speech intent
+        self.orchestrator = AIXIOrchestrator(
             d_state=d,
             d_action=self.config.d_action,
             n_actions=self.config.n_actions,
@@ -60,13 +52,8 @@ class LunaBrain(nn.Module):
             horizon=self.config.aixi_horizon,
             thalamus=self.thalamus,
         )
-        self.aixi_speech = AIXIWhiteBoxPlanner(
-            d_state=d,
-            n_intents=self.config.n_actions,
-            n_hypotheses=self.config.n_hypotheses,
-            horizon=self.config.aixi_horizon,
-            thalamus=self.thalamus,
-        )
+
+        self.multitask = MultiTaskRuntime(d, n_slots=self.config.n_goal_slots)
         self.capabilities = CapabilitySuite(
             d_model=d,
             vocab_size=self.config.vocab_size,
@@ -84,14 +71,14 @@ class LunaBrain(nn.Module):
         )
         self.intent_energy = nn.Linear(d, self.config.speech_vocab_size)
 
-        self.pathways.bump("scaling_agi", 0.3, "mem accounting")
+        self.pathways.bump("scaling_agi", 0.35, "mem accounting")
         self.pathways.bump(
             "paradigm_shifts",
-            0.55,
-            "SiFu white-box + AIXI global schedule (自研, BriLLM结构借鉴)",
+            0.7,
+            "AIXIOrchestrator + SiFu white-box + 246 micro-LIF (自研)",
         )
-        self.pathways.bump("recursive_improvement", 0.3, "evolution engine")
-        self.pathways.bump("multi_agent_collectives", 0.3, "multitask+collective")
+        self.pathways.bump("recursive_improvement", 0.35, "evolution engine")
+        self.pathways.bump("multi_agent_collectives", 0.35, "multitask+collective")
 
     @property
     def creator(self):
@@ -100,6 +87,19 @@ class LunaBrain(nn.Module):
     @property
     def constitution(self):
         return CONSTITUTION
+
+    # Read-only aliases (do not register twice — breaks safetensors export)
+    @property
+    def scheduler(self):
+        return self.orchestrator.scheduler
+
+    @property
+    def aixi(self):
+        return self.orchestrator.actor
+
+    @property
+    def aixi_speech(self):
+        return self.orchestrator.speech_planner
 
     def memory_report(self) -> str:
         live = count_params(self)
@@ -126,7 +126,8 @@ class LunaBrain(nn.Module):
         enable_caps: Optional[Dict[str, bool]] = None,
         prompt_ids: Optional[torch.Tensor] = None,
         return_schedule: bool = False,
-    ) -> Dict[str, torch.Tensor]:
+        return_ledger: bool = False,
+    ) -> Dict[str, Any]:
         cfg = self.config
         if state is None:
             state = torch.zeros(1, cfg.d_model)
@@ -139,41 +140,45 @@ class LunaBrain(nn.Module):
         mt = self.multitask(state)
         state = mt["state"]
 
-        # AIXI global scheduling BEFORE cortical ticks
-        area_gate, sched_trace = self.scheduler(state, creator_aligned=creator_aligned)
+        # AIXI owns schedule + action (+ speech intent plan)
+        area_gate, bundle, ledger = self.orchestrator.step(
+            state, creator_aligned=creator_aligned, plan_speech=True
+        )
+        depth = bundle["reasoning_depth"]
         state, atlas_info = self.atlas(
             state,
             area_gate=area_gate,
-            reasoning_depth=sched_trace.reasoning_depth,
+            reasoning_depth=depth if isinstance(depth, int) else int(depth),
         )
         assert atlas_info["activation"].shape[-1] == NUM_AREAS
 
-        aixi_out = self.aixi(state, creator_aligned=creator_aligned)
         caps = self.capabilities(state, enable=enable_caps)
-
-        actions = aixi_out["actions"]
+        actions = bundle["actions"]
         if "capability_action" in caps:
             actions = 0.5 * actions + 0.5 * caps["capability_action"]
 
-        out: Dict[str, object] = {
+        out: Dict[str, Any] = {
             "state": state,
             "activation": atlas_info["activation"],
+            "spike_rates": atlas_info["spike_rates"],
             "area_gate": area_gate,
             "reasoning_depth": atlas_info["reasoning_depth"],
             "actions": actions,
-            "action_indices": aixi_out["action_indices"],
-            "expected_returns": aixi_out["expected_returns"],
+            "action_indices": bundle["action_indices"],
+            "expected_returns": bundle["expected_returns"],
             "slot_scores": mt["slot_scores"],
             "n_active_goals": mt["n_active"],
         }
         out.update({k: v for k, v in caps.items() if k != "capability_action"})
         if return_schedule:
-            out["schedule_trace"] = sched_trace
+            out["schedule_trace"] = bundle["schedule_trace"]
+        if return_ledger:
+            out["aixi_ledger"] = ledger
 
-        if prompt_ids is not None:
+        speech_plan = bundle["speech_plan"]
+        if prompt_ids is not None and speech_plan is not None:
             seed = self.state_to_node(state)
             boost_ctrl, block, _ = self.speech_control.tensors(state.device)
-            speech_plan = self.aixi_speech(state, creator_aligned=creator_aligned)
             intent_boost = self.intent_energy(speech_plan["intent_bias"])
             boost = boost_ctrl.unsqueeze(0) + intent_boost
             sifu_out = self.sifu(
@@ -191,7 +196,7 @@ class LunaBrain(nn.Module):
             out["speech_attention"] = sifu_out["attention"]
             out["speech_intent"] = speech_plan["intent_indices"]
             out["speech_returns"] = speech_plan["expected_returns"]
-        return out  # type: ignore[return-value]
+        return out
 
     def reason(
         self,
@@ -200,8 +205,9 @@ class LunaBrain(nn.Module):
         max_new: Optional[int] = None,
         creator_aligned: bool = True,
         top_k_areas: int = 16,
+        dump_all_areas: bool = False,
     ) -> WhiteBoxReasoning:
-        """Full white-box cognitive step: schedule → atlas parse → optional speech."""
+        """Full white-box cognitive step: AIXI ledger → atlas parse → optional speech."""
         cfg = self.config
         if state is None:
             device = prompt_ids.device if prompt_ids is not None else torch.device("cpu")
@@ -211,13 +217,22 @@ class LunaBrain(nn.Module):
             creator_aligned=creator_aligned,
             prompt_ids=prompt_ids,
             return_schedule=True,
+            return_ledger=True,
         )
         sched = core["schedule_trace"]
+        ledger = core["aixi_ledger"]
         atlas_rep = self.analyzer.analyze(
             core["activation"],
             schedule_ids=sched.chosen_area_ids,
             top_k=top_k_areas,
         )
+        all_areas = None
+        if dump_all_areas:
+            all_areas = self.analyzer.analyze_all(
+                core["activation"],
+                schedule_ids=sched.chosen_area_ids,
+                spike_rates=core["spike_rates"],
+            )
         speech_trace = None
         if prompt_ids is not None:
             spoke = self.speak(
@@ -231,6 +246,8 @@ class LunaBrain(nn.Module):
             atlas=atlas_rep,
             schedule=sched,
             speech=speech_trace,
+            ledger=ledger,
+            all_areas=all_areas,
             aixi_action_index=int(core["action_indices"][0].item()),
             aixi_expected_return=float(core["expected_returns"][0].item()),
         )
@@ -241,12 +258,15 @@ class LunaBrain(nn.Module):
         state: Optional[torch.Tensor] = None,
         max_new: Optional[int] = None,
         creator_aligned: bool = True,
-    ) -> Dict[str, object]:
+    ) -> Dict[str, Any]:
         cfg = self.config
         if state is None:
             state = torch.zeros(1, cfg.d_model, device=prompt_ids.device)
         core = self.forward(
-            state=state, creator_aligned=creator_aligned, return_schedule=True
+            state=state,
+            creator_aligned=creator_aligned,
+            return_schedule=True,
+            return_ledger=True,
         )
         seed = self.state_to_node(core["state"][:1])
         boost_ctrl, block, forced = self.speech_control.tensors(prompt_ids.device)
@@ -278,6 +298,7 @@ class LunaBrain(nn.Module):
             "expected_returns": speech_plan["expected_returns"],
             "activation": core["activation"][:1],
             "schedule": core["schedule_trace"],
+            "aixi_ledger": core["aixi_ledger"],
         }
 
     def creator_control_speech(

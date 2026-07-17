@@ -56,28 +56,38 @@ class BrainnetomeNetwork(nn.Module):
         residual = torch.zeros_like(h)
         macro_idx = self._macro_index.to(h.device)
         gates = F.softplus(self.macro_gate)
+        spike_acc = None
         for _tick in range(depth):
             residual_tick = torch.zeros_like(h)
             acts = []
+            spikes = []
             for i, col in enumerate(self.columns):
                 g = gates[macro_idx[i]]
-                out = col(h) * g
+                out, spike_rate = col(h, return_spikes=True)
+                out = out * g
                 if area_gate is not None:
                     out = out * area_gate[:, i].unsqueeze(-1)
+                    spike_rate = spike_rate * area_gate[:, i]
                 if area_dropout > 0 and self.training:
                     if torch.rand(1).item() < area_dropout:
                         out = out * 0.0
+                        spike_rate = spike_rate * 0.0
                 residual_tick = residual_tick + out
                 acts.append(out.norm(dim=-1))
+                spikes.append(spike_rate)
             activation = torch.stack(acts, dim=-1)
+            spike_mat = torch.stack(spikes, dim=-1)
             area_acts = activation if area_acts is None else area_acts + activation
+            spike_acc = spike_mat if spike_acc is None else spike_acc + spike_mat
             residual = residual + residual_tick
             h = h + 0.05 * residual_tick / NUM_AREAS
         activation = area_acts if area_acts is not None else torch.zeros(B, NUM_AREAS, device=h.device)
+        spike_rates = spike_acc if spike_acc is not None else torch.zeros_like(activation)
         mix = self.area_out(torch.sigmoid(self.area_in(h)))
         new_state = h + 0.1 * residual / (NUM_AREAS * depth) + 0.1 * mix
         info = {
             "activation": activation,
+            "spike_rates": spike_rates / depth,
             "activation_mean": activation.mean(dim=0),
             "reasoning_depth": torch.tensor(depth, device=h.device),
         }

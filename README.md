@@ -14,24 +14,18 @@
 
 能力头（语言 / 感知 / 动作等）**可插拔**，不强制「世界模型 + VLA」唯一范式。
 
-## 白盒推理（自研；结构借鉴交大 BriLLM/SiFu）
+## 白盒推理（全栈自研；结构透明，拒绝黑箱）
 
-- **不是黑箱 Transformer**：语音走 SiFu 式「词元=节点 + 信号能量」路径（参考 [BriLLM arXiv:2503.11299](https://arxiv.org/abs/2503.11299)，**代码全程自研**，不拷贝权重）。
-- **AIXI 全局调度**：`AIXIGlobalScheduler` 对 8 大宏系统 / 246 区做期望回报选区与推理深度。
-- **微→介→宏解析**：每个区有 micro / meso / macro / AIXI-hook 说明，激活后可打印完整白盒报告。
-- **语音主权**：黄照清可 `block` / `force` / `boost` / `silence` 任意词元节点。
+详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+- **AIXIOrchestrator**：调度 / 动作 / 言语意图统一由 AIXI 期望回报决策，产出可审计 `AIXILedger`（含假设混合分解）。
+- **不是黑箱 Transformer**：语音走 SiFu「词元=节点 + 信号能量」（结构借鉴 [BriLLM](https://arxiv.org/abs/2503.11299)，**代码自研**）。
+- **246 区微→介→宏**：每区 LIF-lite 柱 + `FUNCTION_CARDS`；`reason(dump_all_areas=True)` 可导出全部 246 张功能卡。
+- **创造者言语全控**：黄照清 `block` / `force` / `boost` / `silence`。
 
 ```bash
 python scripts/run_brain.py
-# 或
-python - <<'PY'
-import torch
-from brain.modeling_luna_brain import LunaBrain
-b = LunaBrain()
-print(b.reason(state=torch.randn(1,256)).explain())
-b.creator_control_speech(force=[3,4], creator_authorized=True)
-print(b.speak(torch.tensor([[1,2]]))["explanation"])
-PY
+python scripts/demo_whitebox.py --dump-json /tmp/wb.json
 ```
 
 

@@ -17,13 +17,18 @@ class AreaColumn(nn.Module):
         self.out_proj = nn.Linear(d_area, d_model, bias=False)
         self.register_buffer("v_mem", torch.zeros(d_area), persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, D] -> residual [B, D]; also returns mean spike rate via aux."""
+    def forward(
+        self, x: torch.Tensor, return_spikes: bool = False
+    ):
+        """x: [B, D] -> residual [B, D]; optional mean spike rate [B]."""
         h = self.in_proj(x)
-        # LIF-lite: leaky integrate + soft spike
+        # LIF-lite: leaky integrate + soft spike (micro white-box dynamics)
         v = self.lif_leak.sigmoid() * h
         spikes = torch.sigmoid(5.0 * (v - self.thresh))
-        return self.out_proj(spikes * v)
+        out = self.out_proj(spikes * v)
+        if return_spikes:
+            return out, spikes.mean(dim=-1)
+        return out
 
 
 class SharedBackbone(nn.Module):

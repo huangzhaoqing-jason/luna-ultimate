@@ -140,3 +140,50 @@ class AtlasAnalyzer:
             macro_text=macro_summary(),
             aixi_schedule_ids=sorted(sched_set),
         )
+
+    def analyze_all(
+        self,
+        activation: torch.Tensor,
+        schedule_ids: Optional[Sequence[int]] = None,
+        spike_rates: Optional[torch.Tensor] = None,
+        batch_index: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Full 246-area white-box dump (micro→macro + AIXI hook + rates)."""
+        if activation.dim() == 1:
+            act = activation
+        else:
+            act = activation[batch_index]
+        act = act.detach().float().cpu()
+        spikes = None
+        if spike_rates is not None:
+            spikes = (
+                spike_rates
+                if spike_rates.dim() == 1
+                else spike_rates[batch_index]
+            ).detach().float().cpu()
+        sched = set()
+        for i in schedule_ids or []:
+            if 0 <= int(i) < NUM_AREAS:
+                sched.add(int(i) + 1)
+            elif 1 <= int(i) <= NUM_AREAS:
+                sched.add(int(i))
+        rows: List[Dict[str, Any]] = []
+        for i in range(NUM_AREAS):
+            card = card_for(i + 1)
+            rows.append(
+                {
+                    "area_id": card.area_id,
+                    "name": card.name,
+                    "macro": card.macro,
+                    "hemisphere": card.hemisphere,
+                    "activation": float(act[i].item()),
+                    "spike_rate": float(spikes[i].item()) if spikes is not None else None,
+                    "micro": card.micro,
+                    "meso": card.meso,
+                    "macro_role": card.macro_role,
+                    "aixi_hook": card.aixi_hook,
+                    "capabilities": list(card.capabilities),
+                    "scheduled": card.area_id in sched,
+                }
+            )
+        return rows

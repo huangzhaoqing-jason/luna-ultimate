@@ -131,6 +131,25 @@ def test_creator_speech_control_force():
     assert "creator_forced" in spoke["explanation"]
 
 
+def test_aixi_orchestrator_ledger_and_full246():
+    cfg = prototype_config()
+    brain = LunaBrain(cfg)
+    out = brain(torch.randn(1, cfg.d_model), return_ledger=True, return_schedule=True)
+    assert "aixi_ledger" in out
+    assert out["spike_rates"].shape == (1, NUM_AREAS)
+    wb = brain.reason(
+        state=torch.randn(1, cfg.d_model),
+        top_k_areas=8,
+        dump_all_areas=True,
+    )
+    assert wb.ledger is not None
+    assert "AIXI-Ledger" in wb.explain()
+    assert wb.all_areas is not None and len(wb.all_areas) == NUM_AREAS
+    # every card has micro/meso/macro/aixi
+    sample = wb.all_areas[0]
+    assert sample["micro"] and sample["meso"] and sample["macro_role"] and sample["aixi_hook"]
+
+
 if __name__ == "__main__":
     test_constitution_immutable()
     test_246_areas_and_capabilities()
@@ -141,5 +160,6 @@ if __name__ == "__main__":
     test_whitebox_speech_hook()
     test_aixi_global_schedule_and_micromacro()
     test_creator_speech_control_force()
+    test_aixi_orchestrator_ledger_and_full246()
     print("ALL SMOKE TESTS PASSED")
 
