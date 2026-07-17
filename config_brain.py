@@ -17,6 +17,10 @@ class BrainConfig:
     aixi_horizon: int = 3
     n_goal_slots: int = 4
     vocab_size: int = 4096
+    # BriLLM/SiFu white-box speech (token=node)
+    speech_vocab_size: int = 512
+    d_node: int = 32
+    speech_max_new: int = 8
     learning_rate: float = 1e-4
     # Nominal scale story for Pathway 1 (not loaded in prototype)
     nominal_total_params: int = 0
@@ -41,6 +45,9 @@ def scale_100b_config() -> BrainConfig:
         aixi_horizon=5,
         n_goal_slots=8,
         vocab_size=32000,
+        speech_vocab_size=4096,
+        d_node=64,
+        speech_max_new=32,
         nominal_total_params=550_000_000_000,
         active_fraction=0.02,
     )

@@ -33,6 +33,14 @@ def main(argv=None):
     print("expected_returns:", out["expected_returns"].tolist())
     print("pathways:", brain.pathways.status()["paper"])
     print(brain.memory_report())
+
+    # White-box SiFu speech demo (BriLLM-inspired) + creator force
+    prompt = torch.tensor([[1, 2, 3]])
+    brain.creator_control_speech(force=[11, 12], creator_authorized=True)
+    spoken = brain.speak(prompt, state=state, max_new=4)
+    print("speech tokens:", spoken["token_ids"].tolist())
+    print(spoken["explanation"])
+
     if args.evolve:
         rec = brain.evolve_once()
         print("evolution accepted:", rec.accepted, "diagnosis:", rec.diagnosis)

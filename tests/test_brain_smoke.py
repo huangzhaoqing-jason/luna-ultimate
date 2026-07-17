@@ -84,6 +84,15 @@ def test_scale_memory_ratio():
     assert acc.bytes_resident_estimate < acc.bytes_bf16_full * 0.05
 
 
+def test_whitebox_speech_hook():
+    cfg = prototype_config()
+    brain = LunaBrain(cfg)
+    prompt = torch.tensor([[1, 2, 3, 4]])
+    out = brain(prompt_ids=prompt)
+    assert "speech_energies" in out
+    assert out["speech_energies"].shape[-1] == cfg.speech_vocab_size
+
+
 if __name__ == "__main__":
     test_constitution_immutable()
     test_246_areas_and_capabilities()
@@ -91,4 +100,6 @@ if __name__ == "__main__":
     test_pathways_four()
     test_evolution_blocks_safety()
     test_scale_memory_ratio()
+    test_whitebox_speech_hook()
     print("ALL SMOKE TESTS PASSED")
+

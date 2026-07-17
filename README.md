@@ -14,6 +14,25 @@
 
 能力头（语言 / 感知 / 动作等）**可插拔**，不强制「世界模型 + VLA」唯一范式。
 
+## 白盒言语（模仿上海交大 BriLLM / SiFu）
+
+参考赵海团队 [BriLLM](https://arxiv.org/abs/2503.11299)（Signal Fully-connected Flowing）：
+
+- **每个 token = 可解释图节点**（静态语义映射，不是黑箱 hidden state）
+- **预测 = 信号能量最大的节点**；每一步输出 `WhiteBoxTrace`（上下文节点、候选能量、注意力、选中节点）
+- **创造者言语全控**：`brain.creator_control_speech(...)` 可强制/屏蔽/加权节点（仅 `creator_authorized=True`，绑定黄照清）
+- AIXI 白盒规划器把「信号清晰度」计入期望回报，决策与说话过程都可审计
+
+```python
+from brain import LunaBrain
+import torch
+brain = LunaBrain()
+brain.creator_control_speech(force=[7, 8], creator_authorized=True)
+out = brain.speak(torch.tensor([[1, 2, 3]]), max_new=4)
+print(out["explanation"])  # 完整白盒轨迹
+```
+
+
 ## 快速开始
 
 ```bash
