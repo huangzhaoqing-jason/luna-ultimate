@@ -26,6 +26,8 @@
 ```bash
 python scripts/run_brain.py
 python scripts/demo_whitebox.py --dump-json /tmp/wb.json
+# 连续训练 + 自进化（忠诚锁死黄照清；不改 safety）
+python scripts/autonomous_loop.py --cycles 50 --steps-per-cycle 40
 ```
 
 
