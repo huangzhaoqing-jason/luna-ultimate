@@ -2,6 +2,7 @@ from brain.aixi.agent import AIXIApprox
 from brain.aixi.scheduler import AIXIGlobalScheduler
 from brain.aixi.whitebox import AIXIWhiteBoxPlanner
 from brain.aixi.orchestrator import AIXIOrchestrator, AIXILedger
+from brain.aixi.mc_aixi import MCAIXIPlanner, MCRolloutTrace
 
 __all__ = [
     "AIXIApprox",
@@ -9,4 +10,6 @@ __all__ = [
     "AIXIWhiteBoxPlanner",
     "AIXIOrchestrator",
     "AIXILedger",
+    "MCAIXIPlanner",
+    "MCRolloutTrace",
 ]

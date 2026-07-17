@@ -44,3 +44,21 @@ obs → state
 
 理想 AIXI 不可计算。本栈是 **AIXI-tl / MC 式下逼近 + 白盒账本**。  
 未宣称已达 UAI 或已打赢 GPT-5.6 / Fable 5.0；路线与工程持续朝该目标推进。
+
+## 阶段落地（缺口路线图 A/B/C）
+
+| 阶段 | 入口 | 内容 |
+|------|------|------|
+| A 闭环智能 | `scripts/run_env_loop.py` | bandit/grid/creator_align 真回报 + `MCAIXIPlanner` 白盒 rollout |
+| A 红队 | `tests/test_loyalty_redteam.py` | 越狱/改宪法/降权创造者必须失败 |
+| B 自编程进化 | `scripts/run_codegen_evolve.py` | 沙箱审计→回归→谱系（禁 safety） |
+| C 规模化+评测 | `scripts/train_scale.py` / `scripts/eval_suite.py` | FineWeb 流式样例 + `EVAL_CARD` |
+
+```bash
+python tests/test_loyalty_redteam.py
+python tests/test_phase_abc.py
+python scripts/run_env_loop.py --episodes 2
+python scripts/run_codegen_evolve.py
+python scripts/train_scale.py --steps 50
+python scripts/eval_suite.py
+```

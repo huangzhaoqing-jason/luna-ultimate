@@ -13,3 +13,4 @@ build/
 *.safetensors
 .hf_token
 .env
+evolution_artifacts/
