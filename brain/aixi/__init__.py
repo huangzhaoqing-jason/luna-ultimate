@@ -1,4 +1,5 @@
-from brain.aixi.agent import AIXIApprox, AIXIDecision
-from brain.aixi.prior import complexity_prior
+from brain.aixi.agent import AIXIApprox
+from brain.aixi.scheduler import AIXIGlobalScheduler
+from brain.aixi.whitebox import AIXIWhiteBoxPlanner
 
-__all__ = ["AIXIApprox", "AIXIDecision", "complexity_prior"]
+__all__ = ["AIXIApprox", "AIXIGlobalScheduler", "AIXIWhiteBoxPlanner"]

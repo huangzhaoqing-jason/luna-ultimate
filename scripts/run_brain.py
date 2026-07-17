@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI: one forward + optional evolution step."""
+"""CLI: AIXI schedule + white-box reason + creator speech control."""
 
 from __future__ import annotations
 
@@ -26,15 +26,18 @@ def main(argv=None):
     brain = LunaBrain(cfg)
     state = torch.randn(1, cfg.d_model)
     goals = torch.randn(min(2, cfg.n_goal_slots), cfg.d_model)
-    out = brain(state, goal_states=goals)
+    out = brain(state, goal_states=goals, return_schedule=True)
     print("creator:", brain.creator.name_zh, brain.creator.birth_date)
     print("activation:", tuple(out["activation"].shape))
     print("actions:", tuple(out["actions"].shape))
     print("expected_returns:", out["expected_returns"].tolist())
+    print(out["schedule_trace"].explain())
     print("pathways:", brain.pathways.status()["paper"])
     print(brain.memory_report())
 
-    # White-box SiFu speech demo (BriLLM-inspired) + creator force
+    wb = brain.reason(state=state, top_k_areas=6)
+    print(wb.explain())
+
     prompt = torch.tensor([[1, 2, 3]])
     brain.creator_control_speech(force=[11, 12], creator_authorized=True)
     spoken = brain.speak(prompt, state=state, max_new=4)

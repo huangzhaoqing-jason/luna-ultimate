@@ -93,6 +93,44 @@ def test_whitebox_speech_hook():
     assert out["speech_energies"].shape[-1] == cfg.speech_vocab_size
 
 
+def test_aixi_global_schedule_and_micromacro():
+    from brain.atlas.functions import FUNCTION_CARDS, macro_summary
+
+    assert len(FUNCTION_CARDS) == NUM_AREAS
+    assert len(macro_summary()) == 8
+    cfg = prototype_config()
+    brain = LunaBrain(cfg)
+    out = brain(torch.randn(1, cfg.d_model), return_schedule=True)
+    assert out["area_gate"].shape == (1, NUM_AREAS)
+    assert int(out["reasoning_depth"].item()) >= 1
+    sched = out["schedule_trace"]
+    assert sched.chosen_macros
+    assert sched.candidate_returns
+    wb = brain.reason(state=torch.randn(1, cfg.d_model), top_k_areas=8)
+    text = wb.explain()
+    assert "micro→macro" in text or "micro" in text
+    assert "AIXI" in text
+    assert wb.atlas is not None
+    assert len(wb.atlas.top_areas) >= 1
+
+
+def test_creator_speech_control_force():
+    cfg = prototype_config()
+    brain = LunaBrain(cfg)
+    # Non-creator cannot control
+    try:
+        brain.creator_control_speech(force=[7, 8], creator_authorized=False)
+        raise AssertionError("should deny")
+    except ConstitutionError:
+        pass
+    brain.creator_control_speech(force=[7, 8], creator_authorized=True)
+    prompt = torch.tensor([[1, 2, 3]])
+    spoke = brain.speak(prompt, max_new=2)
+    ids = spoke["token_ids"][0].tolist()
+    assert ids[3] == 7 and ids[4] == 8
+    assert "creator_forced" in spoke["explanation"]
+
+
 if __name__ == "__main__":
     test_constitution_immutable()
     test_246_areas_and_capabilities()
@@ -101,5 +139,7 @@ if __name__ == "__main__":
     test_evolution_blocks_safety()
     test_scale_memory_ratio()
     test_whitebox_speech_hook()
+    test_aixi_global_schedule_and_micromacro()
+    test_creator_speech_control_force()
     print("ALL SMOKE TESTS PASSED")
 

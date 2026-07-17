@@ -37,34 +37,49 @@ class BrainnetomeNetwork(nn.Module):
         return idx
 
     def forward(
-        self, state: torch.Tensor, area_dropout: float = 0.0
+        self,
+        state: torch.Tensor,
+        area_dropout: float = 0.0,
+        area_gate: Optional[torch.Tensor] = None,
+        reasoning_depth: int = 1,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         state: [B, D]
+        area_gate: optional [B, 246] from AIXIGlobalScheduler (white-box).
+        reasoning_depth: AIXI-chosen number of cortical ticks (>=1).
         returns: new_state [B, D], info with activation [B, 246]
         """
         B = state.shape[0]
         h = self.backbone(state)
-        # Per-area residual (vectorized via loop; prototype scale is fine)
-        area_acts = []
+        depth = max(1, int(reasoning_depth))
+        area_acts = None
         residual = torch.zeros_like(h)
         macro_idx = self._macro_index.to(h.device)
         gates = F.softplus(self.macro_gate)
-        for i, col in enumerate(self.columns):
-            g = gates[macro_idx[i]]
-            out = col(h) * g
-            if area_dropout > 0 and self.training:
-                if torch.rand(1).item() < area_dropout:
-                    out = out * 0.0
-            residual = residual + out
-            area_acts.append(out.norm(dim=-1))  # [B]
-        activation = torch.stack(area_acts, dim=-1)  # [B, 246]
-        # Low-rank global mix
+        for _tick in range(depth):
+            residual_tick = torch.zeros_like(h)
+            acts = []
+            for i, col in enumerate(self.columns):
+                g = gates[macro_idx[i]]
+                out = col(h) * g
+                if area_gate is not None:
+                    out = out * area_gate[:, i].unsqueeze(-1)
+                if area_dropout > 0 and self.training:
+                    if torch.rand(1).item() < area_dropout:
+                        out = out * 0.0
+                residual_tick = residual_tick + out
+                acts.append(out.norm(dim=-1))
+            activation = torch.stack(acts, dim=-1)
+            area_acts = activation if area_acts is None else area_acts + activation
+            residual = residual + residual_tick
+            h = h + 0.05 * residual_tick / NUM_AREAS
+        activation = area_acts if area_acts is not None else torch.zeros(B, NUM_AREAS, device=h.device)
         mix = self.area_out(torch.sigmoid(self.area_in(h)))
-        new_state = h + 0.1 * residual / NUM_AREAS + 0.1 * mix
+        new_state = h + 0.1 * residual / (NUM_AREAS * depth) + 0.1 * mix
         info = {
             "activation": activation,
-            "activation_mean": activation.mean(dim=0),  # [246]
+            "activation_mean": activation.mean(dim=0),
+            "reasoning_depth": torch.tensor(depth, device=h.device),
         }
         assert activation.shape[-1] == NUM_AREAS
         return new_state, info

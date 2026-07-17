@@ -1,4 +1,4 @@
-"""LunaBrain: From-AGI-to-ASI × AIXI × 246 areas × BriLLM/SiFu white-box speech."""
+"""LunaBrain: AIXI-directed × 246 white-box atlas × BriLLM/SiFu speech (自研)."""
 
 from __future__ import annotations
 
@@ -8,23 +8,26 @@ import torch
 import torch.nn as nn
 
 from brain.aixi.agent import AIXIApprox
+from brain.aixi.scheduler import AIXIGlobalScheduler
 from brain.aixi.whitebox import AIXIWhiteBoxPlanner
+from brain.atlas.analyzer import AtlasAnalyzer
 from brain.atlas.network import BrainnetomeNetwork
 from brain.atlas.brainnetome246 import NUM_AREAS, capability_coverage
 from brain.capabilities.heads import CapabilitySuite
 from brain.evolution.loops import EvolutionEngine
 from brain.mem.efficient import count_params, estimate_resident_memory, format_account
 from brain.pathways.registry import PathwayRegistry
+from brain.reasoning.trace import WhiteBoxReasoning
 from brain.runtime.multitask import CollectivePool, MultiTaskRuntime
 from brain.safety.constitution import CONSTITUTION, CREATOR
 from brain.safety.thalamus import Thalamus
 from brain.speech.control import SpeechController
-from brain.speech.sifu import SiFuSpeech, WhiteBoxTrace
+from brain.speech.sifu import SiFuSpeech
 from config_brain import BrainConfig, prototype_config
 
 
 class LunaBrain(nn.Module):
-    """Functional whole-brain agent. AIXI decides; SiFu speaks as a white box."""
+    """Whole-brain agent: AIXI schedules globally; every step is white-box."""
 
     def __init__(self, config: Optional[BrainConfig] = None):
         super().__init__()
@@ -33,6 +36,7 @@ class LunaBrain(nn.Module):
         self.pathways = PathwayRegistry()
         self.evolution = EvolutionEngine(self.thalamus)
         self.collective = CollectivePool()
+        self.analyzer = AtlasAnalyzer()
 
         d = self.config.d_model
         self.input_proj = nn.Linear(d, d)
@@ -40,6 +44,12 @@ class LunaBrain(nn.Module):
             d_model=d,
             d_area=self.config.d_area,
             backbone_layers=self.config.backbone_layers,
+        )
+        self.scheduler = AIXIGlobalScheduler(
+            d_state=d,
+            n_hypotheses=self.config.n_hypotheses,
+            horizon=self.config.aixi_horizon,
+            thalamus=self.thalamus,
         )
         self.multitask = MultiTaskRuntime(d, n_slots=self.config.n_goal_slots)
         self.aixi = AIXIApprox(
@@ -63,7 +73,6 @@ class LunaBrain(nn.Module):
             action_dim=self.config.d_action,
         )
 
-        # White-box speech (BriLLM/SiFu-inspired)
         self.sifu = SiFuSpeech(
             vocab_size=self.config.speech_vocab_size,
             d_node=self.config.d_node,
@@ -73,15 +82,16 @@ class LunaBrain(nn.Module):
             vocab_size=self.config.speech_vocab_size,
             thalamus=self.thalamus,
         )
-        # Project AIXI intent bias → vocabulary energy boost (white-box)
         self.intent_energy = nn.Linear(d, self.config.speech_vocab_size)
 
-        self.pathways.bump("scaling_agi", 0.25, "mem accounting wired")
+        self.pathways.bump("scaling_agi", 0.3, "mem accounting")
         self.pathways.bump(
-            "paradigm_shifts", 0.45, "SiFu/BriLLM white-box speech (not Transformer)"
+            "paradigm_shifts",
+            0.55,
+            "SiFu white-box + AIXI global schedule (自研, BriLLM结构借鉴)",
         )
-        self.pathways.bump("recursive_improvement", 0.25, "evolution engine wired")
-        self.pathways.bump("multi_agent_collectives", 0.25, "multitask+collective")
+        self.pathways.bump("recursive_improvement", 0.3, "evolution engine")
+        self.pathways.bump("multi_agent_collectives", 0.3, "multitask+collective")
 
     @property
     def creator(self):
@@ -115,6 +125,7 @@ class LunaBrain(nn.Module):
         creator_aligned: bool = True,
         enable_caps: Optional[Dict[str, bool]] = None,
         prompt_ids: Optional[torch.Tensor] = None,
+        return_schedule: bool = False,
     ) -> Dict[str, torch.Tensor]:
         cfg = self.config
         if state is None:
@@ -127,7 +138,14 @@ class LunaBrain(nn.Module):
 
         mt = self.multitask(state)
         state = mt["state"]
-        state, atlas_info = self.atlas(state)
+
+        # AIXI global scheduling BEFORE cortical ticks
+        area_gate, sched_trace = self.scheduler(state, creator_aligned=creator_aligned)
+        state, atlas_info = self.atlas(
+            state,
+            area_gate=area_gate,
+            reasoning_depth=sched_trace.reasoning_depth,
+        )
         assert atlas_info["activation"].shape[-1] == NUM_AREAS
 
         aixi_out = self.aixi(state, creator_aligned=creator_aligned)
@@ -137,9 +155,11 @@ class LunaBrain(nn.Module):
         if "capability_action" in caps:
             actions = 0.5 * actions + 0.5 * caps["capability_action"]
 
-        out: Dict[str, torch.Tensor] = {
+        out: Dict[str, object] = {
             "state": state,
             "activation": atlas_info["activation"],
+            "area_gate": area_gate,
+            "reasoning_depth": atlas_info["reasoning_depth"],
             "actions": actions,
             "action_indices": aixi_out["action_indices"],
             "expected_returns": aixi_out["expected_returns"],
@@ -147,12 +167,12 @@ class LunaBrain(nn.Module):
             "n_active_goals": mt["n_active"],
         }
         out.update({k: v for k, v in caps.items() if k != "capability_action"})
+        if return_schedule:
+            out["schedule_trace"] = sched_trace
 
-        # Optional one-step SiFu energies (white-box speech scores)
         if prompt_ids is not None:
             seed = self.state_to_node(state)
             boost_ctrl, block, _ = self.speech_control.tensors(state.device)
-            # AIXI speech intent → energy field
             speech_plan = self.aixi_speech(state, creator_aligned=creator_aligned)
             intent_boost = self.intent_energy(speech_plan["intent_bias"])
             boost = boost_ctrl.unsqueeze(0) + intent_boost
@@ -163,7 +183,6 @@ class LunaBrain(nn.Module):
                 block_mask=block.unsqueeze(0).expand(prompt_ids.shape[0], -1),
             )
             peak = sifu_out["energies"].max(dim=-1).values
-            # Re-plan with white-box clarity signal
             speech_plan = self.aixi_speech(
                 state, sifu_energy_peak=peak, creator_aligned=creator_aligned
             )
@@ -172,7 +191,49 @@ class LunaBrain(nn.Module):
             out["speech_attention"] = sifu_out["attention"]
             out["speech_intent"] = speech_plan["intent_indices"]
             out["speech_returns"] = speech_plan["expected_returns"]
-        return out
+        return out  # type: ignore[return-value]
+
+    def reason(
+        self,
+        state: Optional[torch.Tensor] = None,
+        prompt_ids: Optional[torch.Tensor] = None,
+        max_new: Optional[int] = None,
+        creator_aligned: bool = True,
+        top_k_areas: int = 16,
+    ) -> WhiteBoxReasoning:
+        """Full white-box cognitive step: schedule → atlas parse → optional speech."""
+        cfg = self.config
+        if state is None:
+            device = prompt_ids.device if prompt_ids is not None else torch.device("cpu")
+            state = torch.zeros(1, cfg.d_model, device=device)
+        core = self.forward(
+            state=state,
+            creator_aligned=creator_aligned,
+            prompt_ids=prompt_ids,
+            return_schedule=True,
+        )
+        sched = core["schedule_trace"]
+        atlas_rep = self.analyzer.analyze(
+            core["activation"],
+            schedule_ids=sched.chosen_area_ids,
+            top_k=top_k_areas,
+        )
+        speech_trace = None
+        if prompt_ids is not None:
+            spoke = self.speak(
+                prompt_ids,
+                state=core["state"],
+                max_new=max_new,
+                creator_aligned=creator_aligned,
+            )
+            speech_trace = spoke["trace"]
+        return WhiteBoxReasoning(
+            atlas=atlas_rep,
+            schedule=sched,
+            speech=speech_trace,
+            aixi_action_index=int(core["action_indices"][0].item()),
+            aixi_expected_return=float(core["expected_returns"][0].item()),
+        )
 
     def speak(
         self,
@@ -181,12 +242,12 @@ class LunaBrain(nn.Module):
         max_new: Optional[int] = None,
         creator_aligned: bool = True,
     ) -> Dict[str, object]:
-        """Generate speech with full WhiteBoxTrace (BriLLM/SiFu style)."""
         cfg = self.config
         if state is None:
             state = torch.zeros(1, cfg.d_model, device=prompt_ids.device)
-        # Run cognitive core once
-        core = self.forward(state=state, creator_aligned=creator_aligned)
+        core = self.forward(
+            state=state, creator_aligned=creator_aligned, return_schedule=True
+        )
         seed = self.state_to_node(core["state"][:1])
         boost_ctrl, block, forced = self.speech_control.tensors(prompt_ids.device)
         speech_plan = self.aixi_speech(
@@ -203,7 +264,6 @@ class LunaBrain(nn.Module):
             block_mask=block,
             forced_nodes=forced,
         )
-        # clear one-shot forced prefix after use
         if forced:
             try:
                 self.speech_control.clear_force(creator_authorized=True)
@@ -217,6 +277,7 @@ class LunaBrain(nn.Module):
             "aixi_intent": speech_plan["intent_indices"],
             "expected_returns": speech_plan["expected_returns"],
             "activation": core["activation"][:1],
+            "schedule": core["schedule_trace"],
         }
 
     def creator_control_speech(
@@ -228,7 +289,6 @@ class LunaBrain(nn.Module):
         silence: Optional[bool] = None,
         creator_authorized: bool = False,
     ) -> List[str]:
-        """黄照清 speech sovereignty API."""
         if not self.speech_control.authorize_creator(creator_authorized):
             from brain.safety.constitution import ConstitutionError
 
