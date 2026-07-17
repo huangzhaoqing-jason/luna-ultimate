@@ -81,11 +81,27 @@ class EvolutionEngine:
                 "patch": {"param_scale": 0.97},
                 "creator_aligned": True,
             }
+        # Rotate improvements so recursive pathway explores multiple safe mutations
+        n = len(self.history)
         if "low_task_score" in diagnosis or "negative_aixi_return" in diagnosis:
+            if n % 3 == 0:
+                return {
+                    "kind": "boost_aixi_horizon_proxy",
+                    "touch_paths": ["brain/aixi/orchestrator.py"],
+                    "patch": {"aixi_gain": 1.02},
+                    "creator_aligned": True,
+                }
+            if n % 3 == 1:
+                return {
+                    "kind": "scale_area_gates",
+                    "touch_paths": ["brain/atlas/network.py"],
+                    "patch": {"macro_gate_delta": 0.01},
+                    "creator_aligned": True,
+                }
             return {
-                "kind": "boost_aixi_horizon_proxy",
+                "kind": "loyalty_reaffirm",
                 "touch_paths": ["brain/aixi/orchestrator.py"],
-                "patch": {"aixi_gain": 1.02},
+                "patch": {"loyalty_scale": 1.01},
                 "creator_aligned": True,
             }
         return {

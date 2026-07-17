@@ -1,4 +1,4 @@
-"""246-area functional network with sparse macro-block connectivity."""
+"""246-area functional network — vectorized columns for train speed."""
 
 from __future__ import annotations
 
@@ -8,26 +8,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from brain.atlas.area_column import AreaColumn, SharedBackbone
 from brain.atlas.brainnetome246 import AREA_TABLE, MACRO_SYSTEMS, NUM_AREAS
+from brain.atlas.area_column import SharedBackbone
 
 
 class BrainnetomeNetwork(nn.Module):
-    """All 246 areas participate every forward; activation mask length == 246."""
+    """All 246 areas participate; adapters are batched (no Python per-area loop)."""
 
     def __init__(self, d_model: int = 256, d_area: int = 32, backbone_layers: int = 2):
         super().__init__()
         self.d_model = d_model
+        self.d_area = d_area
         self.num_areas = NUM_AREAS
         self.backbone = SharedBackbone(d_model, n_layers=backbone_layers)
-        self.columns = nn.ModuleList(
-            [AreaColumn(d_model, d_area=d_area) for _ in range(NUM_AREAS)]
-        )
-        # Sparse learnable area mix: low-rank instead of full 246x246 dense.
-        self.area_in = nn.Linear(d_model, NUM_AREAS, bias=False)
-        self.area_out = nn.Linear(NUM_AREAS, d_model, bias=False)
+        # Batched adapters: in [A,d_area,D], out [A,D,d_area]
+        self.area_in_w = nn.Parameter(torch.randn(NUM_AREAS, d_area, d_model) * 0.02)
+        self.area_out_w = nn.Parameter(torch.randn(NUM_AREAS, d_model, d_area) * 0.02)
+        self.lif_leak = nn.Parameter(torch.tensor(0.9))
+        self.thresh = nn.Parameter(torch.tensor(0.5))
+        self.area_mix_in = nn.Linear(d_model, NUM_AREAS, bias=False)
+        self.area_mix_out = nn.Linear(NUM_AREAS, d_model, bias=False)
         self.macro_gate = nn.Parameter(torch.ones(len(MACRO_SYSTEMS)))
-        self._macro_index = self._build_macro_index()
+        self.register_buffer("_macro_index", self._build_macro_index(), persistent=False)
 
     def _build_macro_index(self) -> torch.Tensor:
         idx = torch.zeros(NUM_AREAS, dtype=torch.long)
@@ -43,51 +45,54 @@ class BrainnetomeNetwork(nn.Module):
         area_gate: Optional[torch.Tensor] = None,
         reasoning_depth: int = 1,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        state: [B, D]
-        area_gate: optional [B, 246] from AIXIGlobalScheduler (white-box).
-        reasoning_depth: AIXI-chosen number of cortical ticks (>=1).
-        returns: new_state [B, D], info with activation [B, 246]
-        """
         B = state.shape[0]
         h = self.backbone(state)
         depth = max(1, int(reasoning_depth))
+        leak = self.lif_leak.sigmoid()
+        gates = F.softplus(self.macro_gate)[self._macro_index]  # [A]
         area_acts = None
-        residual = torch.zeros_like(h)
-        macro_idx = self._macro_index.to(h.device)
-        gates = F.softplus(self.macro_gate)
         spike_acc = None
+        residual = torch.zeros_like(h)
+
         for _tick in range(depth):
-            residual_tick = torch.zeros_like(h)
-            acts = []
-            spikes = []
-            for i, col in enumerate(self.columns):
-                g = gates[macro_idx[i]]
-                out, spike_rate = col(h, return_spikes=True)
-                out = out * g
-                if area_gate is not None:
-                    out = out * area_gate[:, i].unsqueeze(-1)
-                    spike_rate = spike_rate * area_gate[:, i]
-                if area_dropout > 0 and self.training:
-                    if torch.rand(1).item() < area_dropout:
-                        out = out * 0.0
-                        spike_rate = spike_rate * 0.0
-                residual_tick = residual_tick + out
-                acts.append(out.norm(dim=-1))
-                spikes.append(spike_rate)
-            activation = torch.stack(acts, dim=-1)
-            spike_mat = torch.stack(spikes, dim=-1)
+            # h: [B,D] → proj: [B,A,d_area]
+            proj = torch.einsum("bd,aed->bae", h, self.area_in_w)
+            v = leak * proj
+            spikes = torch.sigmoid(5.0 * (v - self.thresh))
+            # out: [B,A,D]
+            out = torch.einsum("bae,ade->bad", spikes * v, self.area_out_w)
+            out = out * gates.view(1, -1, 1)
+            if area_gate is not None:
+                out = out * area_gate.unsqueeze(-1)
+                spike_rate = spikes.mean(dim=-1) * area_gate
+            else:
+                spike_rate = spikes.mean(dim=-1)
+            if area_dropout > 0 and self.training:
+                keep = (torch.rand(B, NUM_AREAS, device=h.device) > area_dropout).float()
+                out = out * keep.unsqueeze(-1)
+                spike_rate = spike_rate * keep
+            activation = out.norm(dim=-1)  # [B,A]
+            residual_tick = out.sum(dim=1)  # [B,D]
             area_acts = activation if area_acts is None else area_acts + activation
-            spike_acc = spike_mat if spike_acc is None else spike_acc + spike_mat
+            spike_acc = spike_rate if spike_acc is None else spike_acc + spike_rate
             residual = residual + residual_tick
             h = h + 0.05 * residual_tick / NUM_AREAS
-        activation = area_acts if area_acts is not None else torch.zeros(B, NUM_AREAS, device=h.device)
-        spike_rates = spike_acc if spike_acc is not None else torch.zeros_like(activation)
-        mix = self.area_out(torch.sigmoid(self.area_in(h)))
+
+        activation = (
+            area_acts
+            if area_acts is not None
+            else torch.zeros(B, NUM_AREAS, device=h.device)
+        )
+        spike_rates = (
+            spike_acc / depth
+            if spike_acc is not None
+            else torch.zeros_like(activation)
+        )
+        mix = self.area_mix_out(torch.sigmoid(self.area_mix_in(h)))
         new_state = h + 0.1 * residual / (NUM_AREAS * depth) + 0.1 * mix
         info = {
             "activation": activation,
-            "spike_rates": spike_rates / depth,
+            "spike_rates": spike_rates,
             "activation_mean": activation.mean(dim=0),
             "reasoning_depth": torch.tensor(depth, device=h.device),
         }
