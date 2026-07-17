@@ -28,13 +28,24 @@ python scripts/run_brain.py
 python scripts/export_weights.py --out checkpoints/luna-brain-prototype
 ```
 
-上传到 Hugging Face（需 `HF_TOKEN`）：
+上传到 **ModelScope（已支持）**：
+
+```bash
+export MODELSCOPE_API_TOKEN=...
+python scripts/publish_modelscope.py \
+  --dir checkpoints/luna-brain-prototype \
+  --repo huang18928827157/luna-brain
+```
+
+当前公开仓：https://modelscope.cn/models/huang18928827157/luna-brain
+
+可选上传到 Hugging Face（需 `HF_TOKEN`）：
 
 ```bash
 python scripts/publish_hf.py --dir checkpoints/luna-brain-prototype --repo YOUR_USER/luna-brain
 ```
 
-旧 ModelScope 仓库与上传脚本已移除；请用 Hugging Face 作为开源分发渠道。若你仍持有摩搭上的旧 `luna-ultimate-550b`，请在摩搭网页自行删除该模型仓。
+旧摩搭仓 `huang18928827157/luna-ultimate` **API 无法删除**（须网页删），见 [MODELSCOPE.md](MODELSCOPE.md)。
 
 ## 训练数据（检索到的高质量开源集）
 

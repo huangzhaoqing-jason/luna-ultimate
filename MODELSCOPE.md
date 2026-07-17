@@ -1,14 +1,25 @@
-# ModelScope / 摩搭：已清空
+# ModelScope / 摩搭
 
-本仓库**已删除**全部旧 ModelScope 上传/下载脚本与 `luna-ultimate-550b` 相关代码路径。
+## 当前开源模型仓（已上传）
 
-开源分发改为：
+- **https://modelscope.cn/models/huang18928827157/luna-brain**
+- 内容：Luna Brain 原型权重（`model.safetensors` + `config.json` + `configuration.json` + README）
+- 源码：本 GitHub 仓库（Apache-2.0）
 
-1. GitHub 本仓库（源码）  
-2. Hugging Face：`scripts/export_weights.py` + `scripts/publish_hf.py`（需 `HF_TOKEN`）
+上传命令：
 
-## 如何删除你账号下旧的摩搭模型仓
+```bash
+export MODELSCOPE_API_TOKEN=...
+python scripts/export_weights.py
+python scripts/publish_modelscope.py \
+  --dir checkpoints/luna-brain-prototype \
+  --repo huang18928827157/luna-brain
+```
 
-本环境**没有** ModelScope API Token，无法代你远程删仓。请登录 [modelscope.cn](https://www.modelscope.cn/) → 模型 → `huang18928827157/luna-ultimate-550b`（或你的旧命名空间）→ 设置 → 删除模型。
+## 旧仓删除
 
-若你之后提供 `MODELSCOPE_API_TOKEN`，可再用官方 CLI 删除；当前默认不再维护摩搭同步。
+API Token **不能**删除模型仓（摩搭限制：须网页删除）。
+
+请登录 https://www.modelscope.cn → 模型 `huang18928827157/luna-ultimate` → 设置 → 删除。
+
+新架构权重请使用 **`luna-brain`**，勿再依赖旧 `luna-ultimate` 权重脚本（已从源码移除）。
