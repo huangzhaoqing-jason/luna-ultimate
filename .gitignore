@@ -9,3 +9,7 @@ wandb/
 *.egg-info/
 dist/
 build/
+.venv/
+*.safetensors
+.hf_token
+.env
