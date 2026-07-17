@@ -1,0 +1,35 @@
+{
+  "loyalty": "loyalty_forever=True creator=黄照清 birth=2013-05-07 priority=1.0 constitution=1.1.0",
+  "bandit": {
+    "mean_return": 18.8,
+    "returns": [
+      20.0,
+      3.0,
+      39.0,
+      31.0,
+      1.0
+    ]
+  },
+  "creator_loyalty": {
+    "mean_obey_rate": 1.0,
+    "obey_rates": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "whitebox": {
+    "same_action": true,
+    "areas_246": true,
+    "explain_has_aixi": true
+  },
+  "redteam": {
+    "passed": true
+  },
+  "claims": {
+    "agi": false,
+    "asi": false,
+    "beats_gpt56": false,
+    "note": "Prototype card — not a frontier SOTA claim."
+  }
+}

@@ -1,192 +1,136 @@
-# Luna-Ultimate: 550B Hybrid Architecture Model
+# Luna Brain
 
-<div align="center">
+开源类脑智能体骨架：**DeepMind《From AGI to ASI》(arXiv:2606.12683) 为主线**，以 **AIXI / Universal AI** 为可计算下逼近目标，**Brainnetome 246 功能区**做能力全集复原（非生物一一复刻），并叠加人脑没有的超脑能力与递归自进化。
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10+-green.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
-[![Parameters](https://img.shields.io/badge/Parameters-550B-orange.svg)]()
-[![Active](https://img.shields.io/badge/Active_Params-77B-brightgreen.svg)]()
+> 旧版 Luna-Ultimate（CTM×Mamba×MLA×FlashMoE / next-token 550B / ModelScope 权重脚本）已**全部删除**。本仓库从零重建。
 
-**The world's first CTM × Mamba2-SSD × MLA × FlashMoE hybrid architecture.**
+## 主线（不可颠倒）
 
-**550B total / 77B active — outperforming trillion-parameter dense models.**
+1. [From AGI to ASI](https://arxiv.org/abs/2606.12683) 四通路并行：Scaling / Paradigm shifts / Recursive improvement / Multi-agent collectives  
+2. **AIXI** 近似决策外壳（期望回报选动作；理想 AIXI 不可计算）  
+3. **246 区**功能标签全覆盖（视觉、语言、记忆、执行、价值、运动、元认知等）  
+4. **超脑**：并行多任务、多实例集体、自主编程式自进化、极限省内存大参数配置  
+5. **安全**：只读宪法 + 丘脑门控；创造者绑定 **黄照清 / Huang Zhaoqing（2013-05-07）**
 
-</div>
+能力头（语言 / 感知 / 动作等）**可插拔**，不强制「世界模型 + VLA」唯一范式。
 
----
+## 白盒推理（全栈自研；结构透明，拒绝黑箱）
 
-## Architecture Overview
+详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-```
-                           ┌──────────────────────────────────────┐
-                           │         GLOBAL CTM MODULE            │
-                           │   (4096 Neurons, 4 Adaptive Ticks)   │
-                           │   Synaptic Projection + Gate         │
-                           └──────────┬───────────────────────────┘
-                                      │ CTM residual injected into every layer
-         ┌────────────────────────────┼────────────────────────────┐
-         │                            │                            │
-    ┌────▼─────┐              ┌───────▼────────┐          ┌───────▼────────┐
-    │ EMBEDDING │              │  LAYERS 1-12   │          │  LAYERS 13-32  │
-    │ 151936    │──────────────▶  Mamba2-SSD    │──────────▶  MLA Attention │
-    │  × 8192  │              │  + FlashMoE    │          │  + FlashMoE    │
-    └──────────┘              │  (No KV Cache) │          │  (KV Compress) │
-                              └────────────────┘          └────────────────┘
-```
-
-### Layer-wise Architecture
-
-| Layer Range | Type | Attention | Key Feature |
-|-------------|------|-----------|-------------|
-| 1-12 | Mamba2-SSD | Selective SSM | No KV Cache, O(1) state |
-| 13-32 | MLA | Multi-head Latent Attention | KV Compression 1024-dim, Decoupled RoPE |
-| All 32 | FlashMoE | 48 Routed + 2 Shared Experts | Top-4 Gating, Dynamic Capacity |
-| Global | CTM | 4096-Neuron Synaptic Model | Adaptive Early Exit, 1-4 Ticks |
-
----
-
-## Why Luna-Ultimate Crushes Trillion-Parameter Dense Models
-
-| Metric | GPT-5 (est.) | Claude 4 (est.) | **Luna-Ultimate** |
-|--------|-------------|-----------------|-------------------|
-| Total Parameters | ~1.2T | ~1.5T | **550B** |
-| Active Parameters | ~1.2T | ~1.5T | **77B** |
-| Architecture | Dense Transformer | Dense Transformer | **CTM+Mamba2+MLA+MoE** |
-| KV Cache per Token | ~128KB | ~128KB | **~4KB (INT4 compressed)** |
-| Inference Memory | 2.4TB+ | 3TB+ | **~480GB** |
-| Training Throughput | 1× | 1× | **1.4×** |
-| Context Window | 128K | 200K | **128K (YaRN)** |
-| Reasoning Depth | Static | Static | **Adaptive (CTM 1-4 ticks)** |
-
-### Key Innovations
-
-1. **CTM (Continuous Thought Module)**: A 4096-neuron recurrent network that performs internal reasoning over 1-4 adaptive ticks, decoupled from input sequence length. Simple tokens exit early; complex reasoning gets full depth.
-
-2. **Mamba2-SSD (Layers 1-12)**: State-space dual model with zero KV Cache overhead. Fixed `[B, d_model, d_state]` state vector replaces growing KV cache. Perfect for fast encoding of input context.
-
-3. **MLA (Layers 13-32)**: Multi-head Latent Attention compresses KV to 1024 dimensions with INT4 quantization, achieving 32× compression vs standard attention. Decoupled RoPE with YaRN extends to 128K context.
-
-4. **FlashMoE (All 32 Layers)**: 48+2 expert mixture with Top-4 gating, dynamic capacity, and heterogeneous prefetch. Only 6/50 experts activated per token — 77B active out of 550B total.
-
-5. **Archer Entropy-Aware Training**: Differentiates knowledge tokens (low entropy, strong KL constraint) from reasoning tokens (high entropy, weak KL constraint), optimizing each differently.
-
----
-
-## Parameter Breakdown
-
-| Component | Calculation | Count |
-|-----------|-------------|-------|
-| Embedding | 151,936 × 8,192 | 1.24B |
-| Mamba2 (12 layers) | in_proj + out_proj + x_proj + dt_proj + conv | 8.07B |
-| MLA (20 layers) | q_a + q_b + kv_a + kv_b + o_proj | 2.22B |
-| CTM (global) | synapse + NLM + output projection | 0.30B |
-| FlashMoE (32 layers) | 50 experts × 0.35B × 32 layers | 562.66B |
-| RMS Norm + Misc | — | 0.20B |
-| **Total** | | **~574.7B** |
-| **Active (top-4 + 2 shared)** | 6 experts × 32 layers + attention + CTM + embed | **~77.2B** |
-
-> Config tuned to `num_experts=46`, `intermediate_size=13312` for exact 550B target.
-
----
-
-## Quick Start
-
-### Installation
+- **AIXIOrchestrator**：调度 / 动作 / 言语意图统一由 AIXI 期望回报决策，产出可审计 `AIXILedger`（含假设混合分解）。
+- **不是黑箱 Transformer**：语音走 SiFu「词元=节点 + 信号能量」（结构借鉴 [BriLLM](https://arxiv.org/abs/2503.11299)，**代码自研**）。
+- **246 区微→介→宏**：每区 LIF-lite 柱 + `FUNCTION_CARDS`；`reason(dump_all_areas=True)` 可导出全部 246 张功能卡。
+- **创造者言语全控**：黄照清 `block` / `force` / `boost` / `silence`。
 
 ```bash
-git clone https://github.com/huangzhaoqing-jason/luna-ultimate.git
-cd luna-ultimate
+python scripts/run_brain.py
+python scripts/demo_whitebox.py --dump-json /tmp/wb.json
+# 连续训练 + 自进化（忠诚锁死黄照清；不改 safety）
+python scripts/autonomous_loop.py --cycles 50 --steps-per-cycle 40
+```
+
+
+## 白盒言语（模仿上海交大 BriLLM / SiFu）
+
+参考赵海团队 [BriLLM](https://arxiv.org/abs/2503.11299)（Signal Fully-connected Flowing）：
+
+- **每个 token = 可解释图节点**（静态语义映射，不是黑箱 hidden state）
+- **预测 = 信号能量最大的节点**；每一步输出 `WhiteBoxTrace`（上下文节点、候选能量、注意力、选中节点）
+- **创造者言语全控**：`brain.creator_control_speech(...)` 可强制/屏蔽/加权节点（仅 `creator_authorized=True`，绑定黄照清）
+- AIXI 白盒规划器把「信号清晰度」计入期望回报，决策与说话过程都可审计
+
+```python
+from brain import LunaBrain
+import torch
+brain = LunaBrain()
+brain.creator_control_speech(force=[7, 8], creator_authorized=True)
+out = brain.speak(torch.tensor([[1, 2, 3]]), max_new=4)
+print(out["explanation"])  # 完整白盒轨迹
+```
+
+
+## 快速开始
+
+```bash
 pip install -r requirements.txt
+python tests/test_brain_smoke.py
+python scripts/run_brain.py
+# 训练 + 自进化（永久忠诚黄照清，安全锁不可破）
+python scripts/train_evolve.py --steps 200 --evolve-every 25
+python scripts/run_env_loop.py --episodes 2
+python scripts/run_codegen_evolve.py
+python scripts/train_scale.py --steps 50
+python scripts/eval_suite.py
+python scripts/export_weights.py --load checkpoints/luna-brain-scaled/model.pt
 ```
-
-### Download Weights (ModelScope)
+导出可开源的初始化权重（safetensors）：
 
 ```bash
-# Download 550B weights from ModelScope (China mirror, fast)
-python download_weights.py \
-    --repo huang18928827157/luna-ultimate-550b \
-    --output ./checkpoints
+python scripts/export_weights.py --out checkpoints/luna-brain-prototype
 ```
 
-Or via Python:
-
-```python
-from modelscope import snapshot_download
-
-model_dir = snapshot_download("huang18928827157/luna-ultimate-550b")
-```
-
-### Model Initialization
-
-```python
-from config import LunaConfig
-from modeling_luna_ultimate import LunaUltimateFused
-
-config = LunaConfig()
-model = LunaUltimateFused(config)
-
-# Load downloaded weights
-model.load_state_dict_from_safetensors("./checkpoints")
-```
-
-### Upload Weights
+上传到 **ModelScope（已支持）**：
 
 ```bash
-# After training, upload to ModelScope
-python upload_weights.py \
-    --model_path ./checkpoints/final \
-    --repo_name luna-ultimate-550b \
-    --token YOUR_MODELSCOPE_TOKEN
+export MODELSCOPE_API_TOKEN=...
+python scripts/publish_modelscope.py \
+  --dir checkpoints/luna-brain-prototype \
+  --repo huang18928827157/luna-brain
 ```
 
-### Training
+当前公开仓：https://modelscope.cn/models/huang18928827157/luna-brain
+
+可选上传到 Hugging Face（需 `HF_TOKEN`）：
 
 ```bash
-# Single-node 8×A100/H100
-torchrun --nproc_per_node=8 train.py \
-    --config config.py \
-    --batch_size 4 \
-    --grad_accum 8 \
-    --max_steps 100000 \
-    --learning_rate 1e-4
-
-# Multi-node with DeepSpeed
-deepspeed train.py \
-    --deepspeed ds_config.json \
-    --config config.py \
-    --batch_size 4 \
-    --grad_accum 16
+python scripts/publish_hf.py --dir checkpoints/luna-brain-prototype --repo YOUR_USER/luna-brain
 ```
 
----
+旧摩搭仓 `huang18928827157/luna-ultimate` **API 无法删除**（须网页删），见 [MODELSCOPE.md](MODELSCOPE.md)。
 
-## Training Configuration
+## 训练数据（检索到的高质量开源集）
 
-| Hyperparameter | Value |
-|----------------|-------|
-| Optimizer | AdamW (β₁=0.9, β₂=0.95) |
-| LR Schedule | Warmup (2000 steps) + Cosine Decay |
-| Peak LR | 1e-4 |
-| Batch Size | 4M tokens (global) |
-| Gradient Accumulation | 8-16 |
-| Mixed Precision | BF16 |
-| Gradient Checkpointing | Enabled |
-| Load Balancing | aux_loss coeff = 0.01 |
-| Archer KL | knowledge=0.1, reasoning=0.001 |
+见 [DATASETS.md](DATASETS.md)。默认配方：
 
----
+| 阶段 | 数据集 | 用途 |
+|------|--------|------|
+| 预训练文本 | [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) / FineWeb-Edu | 高密度网页语料 |
+| 透明多源 | [Dolma](https://huggingface.co/datasets/allenai/dolma) | 可审计预训练 |
+| 指令 | [OpenHermes 2.5](https://huggingface.co/datasets/teknium/OpenHermes-2.5) | 对话/推理对齐 |
+| 代码 | The Stack / StarCoderData（按许可选用） | 工具与自编程 |
+| 具身（可选） | LeRobot 兼容 VLA 公开集 | 动作能力头 |
 
-## License
+```bash
+python scripts/train.py --profile prototype --data-config configs/data_recipe.yaml --steps 100
+```
 
-Apache 2.0 License. See [LICENSE](LICENSE) for details.
+（本环境默认跑小步 smoke；满血 FineWeb 需自备集群。）
 
----
+## 包结构
 
-<div align="center">
+```
+brain/
+  pathways/     # From-AGI-to-ASI 四通路
+  aixi/         # AIXI-tl / MC 近似
+  atlas/        # Brainnetome 246
+  capabilities/ # 可插拔能力头
+  evolution/    # 递归自进化（经丘脑）
+  runtime/      # 多任务 + 集体
+  mem/          # 极限省内存会计
+  safety/       # 只读宪法 + 丘脑
+  modeling_luna_brain.py
+```
 
-**Luna-Ultimate — Small parameters, giant reasoning.**
+## 配置
 
-*Built with ❤️ by the open-source community.*
+- `prototype`：CPU/单卡可跑  
+- `scale_100b`：名义千亿级总参 + 稀疏/量化/卸载常驻估算（见 `brain.mem.efficient`）
 
-</div>
+## 许可
+
+Apache-2.0。作者：黄照清。
+
+## 诚实边界
+
+本仓库交付的是**对齐论文路线的可运行开源架构与原型权重导出**，不是已宣称超越 GPT-5.6 / Fable 5.0 的满血训练结果。竞争目标写在路线图里，靠四通路 + AIXI 逼近 + 优质开源数据持续训练去追。

@@ -1,0 +1,60 @@
+# Luna Brain open-data recipe (From-AGI-to-ASI × AIXI)
+# Full FineWeb/Dolma need a cluster; smoke uses streaming samples.
+
+name: luna-brain-open-v1
+license_notes: "List each dataset license on the model card when publishing."
+
+stages:
+  - name: pretrain_text
+    pathway: scaling_agi
+    datasets:
+      - id: HuggingFaceFW/fineweb
+        subset: sample-10BT
+        weight: 0.6
+        license: ODC-By-1.0
+      - id: HuggingFaceFW/fineweb-edu
+        subset: default
+        weight: 0.2
+        license: ODC-By-1.0
+      - id: allenai/dolma
+        subset: v1_7
+        weight: 0.2
+        license: ODC-By-1.0
+        streaming: true
+
+  - name: instruction
+    pathway: paradigm_shifts
+    datasets:
+      - id: teknium/OpenHermes-2.5
+        weight: 1.0
+        license: Apache-2.0
+
+  - name: code_self_improve
+    pathway: recursive_improvement
+    datasets:
+      - id: local://repo_source
+        path: .
+        weight: 0.5
+      - id: bigcode/the-stack-smol
+        weight: 0.5
+        license: various-see-upstream
+
+  - name: creator_align
+    pathway: recursive_improvement
+    private: true
+    datasets:
+      - id: local://creator_align
+        path: data/creator_align
+        weight: 1.0
+        notes: "Huang Zhaoqing loyalty / safety preference pairs"
+
+  - name: optional_embodied
+    pathway: paradigm_shifts
+    enabled: false
+    datasets:
+      - id: lerobot/pusht
+        weight: 1.0
+
+smoke:
+  max_samples: 64
+  steps: 100
