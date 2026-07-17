@@ -23,11 +23,21 @@ def main(argv=None):
     p.add_argument("--profile", default="prototype", choices=list(PROFILES))
     p.add_argument("--out", type=Path, default=Path("checkpoints/luna-brain-prototype"))
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--load",
+        type=Path,
+        default=None,
+        help="Optional state_dict .pt from train_evolve",
+    )
     args = p.parse_args(argv)
 
     torch.manual_seed(args.seed)
     cfg = PROFILES[args.profile]()
     brain = LunaBrain(cfg)
+    if args.load and args.load.exists():
+        sd = torch.load(args.load, map_location="cpu")
+        brain.load_state_dict(sd, strict=False)
+        print(f"loaded {args.load}")
     args.out.mkdir(parents=True, exist_ok=True)
 
     state = {k: v.detach().cpu().contiguous() for k, v in brain.state_dict().items()}
@@ -39,8 +49,10 @@ def main(argv=None):
         "areas": 246,
         "profile": cfg.profile,
         "creator": {"name_zh": "黄照清", "birth_date": "2013-05-07"},
+        "loyalty_forever": True,
         "license": "Apache-2.0",
-        "note": "Prototype init weights — not a claim of frontier SOTA.",
+        "note": "Trained/evolved prototype — loyalty-locked; not a claim of frontier SOTA.",
+        "loaded_from": str(args.load) if args.load else None,
         "config": cfg.__dict__,
     }
     (args.out / "config.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))

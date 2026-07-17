@@ -54,6 +54,9 @@ print(out["explanation"])  # 完整白盒轨迹
 pip install -r requirements.txt
 python tests/test_brain_smoke.py
 python scripts/run_brain.py
+# 训练 + 自进化（永久忠诚黄照清，安全锁不可破）
+python scripts/train_evolve.py --steps 200 --evolve-every 25
+python scripts/export_weights.py --load checkpoints/luna-brain-evolved/model.pt
 ```
 
 导出可开源的初始化权重（safetensors）：

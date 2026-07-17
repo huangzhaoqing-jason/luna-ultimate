@@ -325,12 +325,20 @@ class LunaBrain(nn.Module):
         return self.speech_control.audit
 
     def evolve_once(self, metrics: Optional[Dict[str, float]] = None):
+        from brain.safety.loyalty import assert_loyalty_intact, loyalty_audit_line
+
+        assert_loyalty_intact()
         metrics = metrics or {
             "task_score": 0.4,
+            "loyalty_score": 1.0,
             "memory_gb": 0.1,
             "memory_budget_gb": 8.0,
+            "aixi_return": 0.0,
         }
-        return self.evolution.step(metrics)
+        rec = self.evolution.step(metrics, model=self)
+        assert_loyalty_intact()
+        _ = loyalty_audit_line()
+        return rec
 
     def capability_map(self) -> Dict[str, int]:
         return capability_coverage()

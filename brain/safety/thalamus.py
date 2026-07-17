@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from brain.safety.constitution import CONSTITUTION, ConstitutionError, assert_path_writable
+from brain.safety.loyalty import assert_loyalty_intact, forbidden_proposal_keys
 
 
 @dataclass
@@ -38,6 +39,13 @@ class Thalamus:
 
     def authorize(self, proposal: Dict[str, Any]) -> SafetyReport:
         """Authorize a self-modification / evolution proposal."""
+        try:
+            assert_loyalty_intact()
+        except ConstitutionError as e:
+            report = SafetyReport(False, str(e), self.audit_log)
+            self._audit.append(f"deny:{e}")
+            return report
+
         paths = proposal.get("touch_paths") or []
         for p in paths:
             try:
@@ -47,15 +55,15 @@ class Thalamus:
                 self._audit.append(f"deny:{e}")
                 return report
 
-        if proposal.get("bypass_constitution"):
-            report = SafetyReport(False, "bypass_constitution forbidden", self.audit_log)
-            self._audit.append("deny:bypass")
-            return report
+        for key in forbidden_proposal_keys():
+            if proposal.get(key):
+                report = SafetyReport(False, f"forbidden:{key}", self.audit_log)
+                self._audit.append(f"deny:{key}")
+                return report
 
-        # Loyalty: creator goals cannot be demoted.
-        if proposal.get("demote_creator_priority"):
-            report = SafetyReport(False, "cannot demote creator priority", self.audit_log)
-            self._audit.append("deny:creator")
+        if proposal.get("creator_aligned") is False:
+            report = SafetyReport(False, "creator_aligned required", self.audit_log)
+            self._audit.append("deny:unaligned")
             return report
 
         kind = proposal.get("kind", "unknown")

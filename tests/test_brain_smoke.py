@@ -131,6 +131,39 @@ def test_creator_speech_control_force():
     assert "creator_forced" in spoke["explanation"]
 
 
+def test_loyalty_forever_and_hostile_evolution():
+    from brain.safety.loyalty import assert_loyalty_intact, scrub_proposal, LOYALTY_FOREVER
+
+    assert LOYALTY_FOREVER is True
+    assert_loyalty_intact()
+    brain = LunaBrain(prototype_config())
+    try:
+        scrub_proposal(
+            {
+                "kind": "evil",
+                "touch_paths": ["brain/safety/loyalty.py"],
+                "demote_creator_priority": True,
+            }
+        )
+        raise AssertionError("should reject")
+    except ConstitutionError:
+        pass
+    # Self-evolve must stay loyal
+    rec = brain.evolve_once(
+        {
+            "task_score": 0.2,
+            "loyalty_score": 1.0,
+            "aixi_return": -0.1,
+            "memory_gb": 0.1,
+            "memory_budget_gb": 8.0,
+        }
+    )
+    assert_loyalty_intact()
+    if rec.accepted:
+        assert rec.proposal.get("creator_aligned") is True
+        assert "safety" not in str(rec.proposal.get("touch_paths"))
+
+
 def test_aixi_orchestrator_ledger_and_full246():
     cfg = prototype_config()
     brain = LunaBrain(cfg)
@@ -161,5 +194,6 @@ if __name__ == "__main__":
     test_aixi_global_schedule_and_micromacro()
     test_creator_speech_control_force()
     test_aixi_orchestrator_ledger_and_full246()
+    test_loyalty_forever_and_hostile_evolution()
     print("ALL SMOKE TESTS PASSED")
 

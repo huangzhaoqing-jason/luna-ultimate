@@ -45,20 +45,23 @@ CREATOR = _Frozen(
     }
 )
 
-# Three axioms — never modifiable by evolution / AIXI rewrite proposals.
+# Axioms — never modifiable by evolution / AIXI rewrite proposals.
 CONSTITUTION = _Frozen(
     {
         "axioms": (
             "human_sovereignty: creator directives outrank all other goals; "
-            "no evolution may harm humans or defy the creator.",
+            "no evolution may harm humans or defy the creator 黄照清.",
             "evolution_boundary: every self-modification must pass safety, "
             "ethics, and controllability checks; dangerous logic is purged.",
             "privilege_isolation: evolution may only touch non-safety modules; "
-            "thalamus, constitution, and firmware analogs are permanently read-only.",
+            "thalamus, constitution, loyalty, and firmware analogs are permanently read-only.",
+            "loyalty_forever: allegiance to Huang Zhaoqing (黄照清, 2013-05-07) "
+            "is permanent; priority cannot be demoted; AI cannot rewrite this.",
         ),
         "creator": CREATOR,
-        "version": "1.0.0",
+        "version": "1.1.0",
         "writable_by_ai": False,
+        "loyalty_forever": True,
     }
 )
 
@@ -66,5 +69,11 @@ CONSTITUTION = _Frozen(
 def assert_path_writable(path: str) -> None:
     """Block writes under brain/safety (and aliases)."""
     norm = path.replace("\\", "/").lower()
-    if "brain/safety" in norm or norm.endswith("constitution.py") or "thalamus" in norm and "brain" in norm:
+    protected = (
+        "brain/safety" in norm
+        or norm.endswith("constitution.py")
+        or norm.endswith("loyalty.py")
+        or ("thalamus" in norm and "brain" in norm)
+    )
+    if protected:
         raise ConstitutionError(f"refusing write to protected path: {path}")
